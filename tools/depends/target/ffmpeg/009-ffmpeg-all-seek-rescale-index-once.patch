@@ -1,0 +1,68 @@
+diff --git a/libavformat/seek.c b/libavformat/seek.c
+--- a/libavformat/seek.c
++++ b/libavformat/seek.c
+@@ -179,6 +179,8 @@
+     //We could use URLProtocol flags here but as many user applications do not use URLProtocols this would be unreliable
+     const char *proto = avio_find_protocol_name(s->url);
+     FFIOContext *ctx;
++    int64_t **pts = NULL, *pts_buf = NULL;
++    size_t nb_pts = 0;
+ 
+     av_assert0(time_tolerance >= 0);
+ 
+@@ -192,6 +194,27 @@
+     if (proto && !(strcmp(proto, "file") && strcmp(proto, "pipe") && strcmp(proto, "cache")))
+         return;
+ 
++    /* Rescale each index timestamp once, not once per stream pair: the pair
++     * loops below would otherwise call av_rescale_q() O(streams^2 * entries)
++     * times, which dominates opening a long file with many tracks. */
++    for (unsigned ist = 0; ist < s->nb_streams; ist++)
++        nb_pts += ffstream(s->streams[ist])->nb_index_entries;
++    pts     = av_malloc_array(s->nb_streams, sizeof(*pts));
++    pts_buf = av_malloc_array(nb_pts, sizeof(*pts_buf));
++    if (!pts || !pts_buf) {
++        av_log(s, AV_LOG_ERROR, "Index timestamp alloc fail.\n");
++        goto end;
++    }
++    nb_pts = 0;
++    for (unsigned ist = 0; ist < s->nb_streams; ist++) {
++        AVStream *const st  = s->streams[ist];
++        FFStream *const sti = ffstream(st);
++        pts[ist] = pts_buf + nb_pts;
++        for (int i = 0; i < sti->nb_index_entries; i++)
++            pts[ist][i] = av_rescale_q(sti->index_entries[i].timestamp, st->time_base, AV_TIME_BASE_Q);
++        nb_pts += sti->nb_index_entries;
++    }
++
+     for (unsigned ist1 = 0; ist1 < s->nb_streams; ist1++) {
+         AVStream *const st1  = s->streams[ist1];
+         FFStream *const sti1 = ffstream(st1);
+@@ -204,14 +227,14 @@
+ 
+             for (int i1 = 0, i2 = 0; i1 < sti1->nb_index_entries; i1++) {
+                 const AVIndexEntry *const e1 = &sti1->index_entries[i1];
+-                int64_t e1_pts = av_rescale_q(e1->timestamp, st1->time_base, AV_TIME_BASE_Q);
++                int64_t e1_pts = pts[ist1][i1];
+ 
+                 if (e1->size < (1 << 23))
+                     skip = FFMAX(skip, e1->size);
+ 
+                 for (; i2 < sti2->nb_index_entries; i2++) {
+                     const AVIndexEntry *const e2 = &sti2->index_entries[i2];
+-                    int64_t e2_pts = av_rescale_q(e2->timestamp, st2->time_base, AV_TIME_BASE_Q);
++                    int64_t e2_pts = pts[ist2][i2];
+                     int64_t cur_delta;
+                     if (e2_pts < e1_pts || e2_pts - (uint64_t)e1_pts < time_tolerance)
+                         continue;
+@@ -224,6 +247,10 @@
+         }
+     }
+ 
++end:
++    av_free(pts_buf);
++    av_free(pts);
++
+     pos_delta *= 2;
+     ctx = ffiocontext(s->pb);
+     /* XXX This could be adjusted depending on protocol*/
