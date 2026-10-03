@@ -12,6 +12,7 @@
 #include "DVDMessageQueue.h"
 #include "DVDStreamInfo.h"
 #include "IVideoPlayer.h"
+#include "Interface/TimingConstants.h"
 #include "cores/AudioEngine/Utils/AELimiter.h"
 #include "threads/Thread.h"
 #include "utils/BitstreamStats.h"
@@ -525,6 +526,10 @@ private:
   std::atomic<std::chrono::nanoseconds> m_fedAudioPts{NO_PTS};
   std::atomic<std::chrono::nanoseconds> m_fedVideoPts{NO_PTS};
   std::atomic<bool> m_started{false};
+  // When no frame has arrived by then after a start or seek, ask the pipeline to play again
+  // (setting videoplayer.starfishresumetimeout). Default-constructed = not armed. Video thread.
+  std::chrono::steady_clock::time_point m_resumeDeadline{};
+  std::atomic<int> m_speed{DVD_PLAYSPEED_NORMAL};
 
   BitstreamStats m_audioStats{};
   BitstreamStats m_videoStats{};

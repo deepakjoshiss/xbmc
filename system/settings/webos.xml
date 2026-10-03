@@ -17,6 +17,21 @@
           <default>true</default>
           <control type="toggle" />
         </setting>
+        <setting id="videoplayer.starfishresumetimeout" type="integer" label="39218" help="39219">
+          <level>2</level>
+          <default>10</default>
+          <constraints>
+            <minimum label="351">0</minimum>
+            <step>1</step>
+            <maximum>60</maximum>
+          </constraints>
+          <dependencies>
+            <dependency type="enable" setting="videoplayer.usestarfishdecoder">true</dependency>
+          </dependencies>
+          <control type="spinner" format="string">
+            <formatlabel>14045</formatlabel>
+          </control>
+        </setting>
       </group>
     </category>
   </section>

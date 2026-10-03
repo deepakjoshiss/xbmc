@@ -513,6 +513,7 @@ void CMediaPipelineWebOS::SendVideoMessage(const std::shared_ptr<CDVDMsg>& msg, 
 
 void CMediaPipelineWebOS::SetSpeed(const int speed)
 {
+  m_speed = speed;
   if (!m_loaded)
     return;
 
@@ -1209,6 +1210,12 @@ bool CMediaPipelineWebOS::FeedVideoData(const std::shared_ptr<CDVDMsg>& msg)
 
     pipeline->sendSegmentEvent();
 
+    const int resumeTimeout = CServiceBroker::GetSettingsComponent()->GetSettings()->GetInt(
+        CSettings::SETTING_VIDEOPLAYER_STARFISHRESUMETIMEOUT);
+    m_resumeDeadline = resumeTimeout > 0
+                           ? std::chrono::steady_clock::now() + std::chrono::seconds(resumeTimeout)
+                           : std::chrono::steady_clock::time_point{};
+
     m_pts = pts;
     m_fedVideoPts = NO_PTS;
     m_fedAudioPts = NO_PTS;
@@ -1382,6 +1389,19 @@ void CMediaPipelineWebOS::Process()
   while (!m_bStop)
   {
     m_videoGate.Checkpoint();
+
+    if (m_resumeDeadline != std::chrono::steady_clock::time_point{})
+    {
+      if (m_started)
+        m_resumeDeadline = {};
+      else if (std::chrono::steady_clock::now() > m_resumeDeadline &&
+               m_speed == DVD_PLAYSPEED_NORMAL)
+      {
+        m_resumeDeadline = {};
+        CLog::LogF(LOGWARNING, "No frame since the start or seek, asking the pipeline to play");
+        SetSpeed(DVD_PLAYSPEED_NORMAL);
+      }
+    }
 
     std::shared_ptr<CDVDMsg> msg = nullptr;
     int priority = 0;
