@@ -1116,6 +1116,12 @@ bool CMediaPipelineWebOS::FeedAudioData(const std::shared_ptr<CDVDMsg>& msg)
   if (pts < 0ns)
     return true;
 
+  // After a load or flush the first video packet sets the decode position (FeedVideoData). Audio
+  // fed before it starts the TV's passthrough decoder against the stale position, and it stays
+  // silent (files that store audio ahead of video, e.g. AC-3/E-AC-3 MP4s, after any seek).
+  if (m_flushed)
+    return false;
+
   const std::chrono::nanoseconds fedAudioPts = m_fedAudioPts.load();
   if (m_started && fedAudioPts != NO_PTS && fedAudioPts - m_pts.load() > MAX_FEED_AHEAD_TIME)
     return false;
