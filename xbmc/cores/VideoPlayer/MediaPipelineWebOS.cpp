@@ -1694,9 +1694,21 @@ void CMediaPipelineWebOS::PlayerCallback(int32_t type, const int64_t numValue, c
       break;
     }
     case PF_EVENT_TYPE_STR_AUDIO_INFO:
+    {
+      // starfish can report {"track":-1,...}, which tv.sound rejects (SOUND_ERROR_019). If it
+      // reaches ACB before setState(loaded), that state change fails with it, the next one is an
+      // "Invalid State Request", and the media never plays as foreground: video without audio.
+      CVariant audioInfo;
+      if (CJSONVariantParser::Parse(logStr, audioInfo) && audioInfo["track"].isInteger() &&
+          audioInfo["track"].asInteger() < 0)
+      {
+        CLog::LogF(LOGDEBUG, "Not forwarding audio info without a track: {}", logStr);
+        break;
+      }
       if (acb)
         AcbAPI_setMediaAudioData(acb->Id(), logStr.c_str(), &acb->TaskId());
       break;
+    }
     case PF_EVENT_TYPE_STR_VIDEO_INFO:
       if (acb)
         AcbAPI_setMediaVideoData(acb->Id(), logStr.c_str(), &acb->TaskId());
