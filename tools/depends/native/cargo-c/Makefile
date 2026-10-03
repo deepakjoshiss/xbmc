@@ -7,7 +7,7 @@ PLATFORM=$(NATIVEPLATFORM)
 
 export PKG_CONFIG_PATH=$(PREFIX)/lib/pkgconfig
 
-APP=$(PLATFORM)/target/release/$(APPNAME)
+APP=$(PLATFORM)/target/release/cargo-cbuild
 
 CARGO_ENV_VARS = RUSTUP_HOME=$(PREFIX)/.rustup \
 	CARGO_HOME=$(PREFIX)/.cargo \

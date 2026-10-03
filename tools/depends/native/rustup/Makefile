@@ -12,7 +12,7 @@ ifeq ($(CROSS_COMPILING),yes)
   endif
 endif
 
-APP=$(PLATFORM)/bin/$(APPNAME)
+APP=$(CARGO_HOME)/bin/$(APPNAME)
 
 export RUSTUP_HOME=$(PREFIX)/.rustup
 export CARGO_HOME=$(PREFIX)/.cargo
