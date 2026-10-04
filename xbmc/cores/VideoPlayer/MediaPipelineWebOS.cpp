@@ -1707,18 +1707,28 @@ void CMediaPipelineWebOS::PlayerCallback(int32_t type, const int64_t numValue, c
     }
     case PF_EVENT_TYPE_STR_AUDIO_INFO:
     {
-      // starfish can report {"track":-1,...}, which tv.sound rejects (SOUND_ERROR_019). If it
-      // reaches ACB before setState(loaded), that state change fails with it, the next one is an
-      // "Invalid State Request", and the media never plays as foreground: video without audio.
+      // webOS 4 starfish reports {"track":-1,"immersive":"ATMOS"}, but tv.sound's
+      // setMediaAudioData needs {"context":<pipeline id>,"audio":{"immersive":...}}: without
+      // "context" it fails (SOUND_ERROR_019), which can fail ACB's loaded state change (video
+      // without audio), and the TV never learns the content is Atmos. Rewrap it.
+      std::string audioData = logStr;
       CVariant audioInfo;
-      if (CJSONVariantParser::Parse(logStr, audioInfo) && audioInfo["track"].isInteger() &&
-          audioInfo["track"].asInteger() < 0)
+      if (CJSONVariantParser::Parse(logStr, audioInfo) && !audioInfo.isMember("context"))
       {
-        CLog::LogF(LOGDEBUG, "Not forwarding audio info without a track: {}", logStr);
-        break;
+        const char* mediaId = m_mediaAPIs->getMediaID();
+        if (!mediaId || !audioInfo["immersive"].isString())
+        {
+          CLog::LogF(LOGDEBUG, "Not forwarding audio info: {}", logStr);
+          break;
+        }
+        CVariant data;
+        data["context"] = mediaId;
+        data["audio"]["immersive"] = audioInfo["immersive"];
+        CJSONVariantWriter::Write(data, audioData, true);
+        CLog::LogF(LOGDEBUG, "Forwarding audio info as {}", audioData);
       }
       if (acb)
-        AcbAPI_setMediaAudioData(acb->Id(), logStr.c_str(), &acb->TaskId());
+        AcbAPI_setMediaAudioData(acb->Id(), audioData.c_str(), &acb->TaskId());
       break;
     }
     case PF_EVENT_TYPE_STR_VIDEO_INFO:
