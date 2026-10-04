@@ -1316,8 +1316,9 @@ DemuxPacket* CDVDDemuxFFmpeg::Read()
   if (m_doviElIndex < 0)
     return ReadInternal(false);
 
-  // A base-layer packet waits for the RPU of the same frame, which the file may store after it
-  // (11 frames later in the MP4s seen). 1 ms covers rounding between differing time bases.
+  // A base-layer packet waits for the enhancement-layer frame decoded with it (same dts; the
+  // layers may reorder differently, so not the pts), which the file may store after it (11 frames
+  // later in the MP4s seen). 1 ms covers rounding between differing time bases.
   constexpr double tolerance = DVD_MSEC_TO_TIME(1);
   constexpr size_t maxHeld = 240;
   while (true)
@@ -1325,8 +1326,9 @@ DemuxPacket* CDVDDemuxFFmpeg::Read()
     if (!m_doviHeld.empty())
     {
       DemuxPacket* front = m_doviHeld.front();
-      const auto rpu = m_doviRpus.lower_bound(front->pts - tolerance);
-      const bool found = rpu != m_doviRpus.end() && rpu->first <= front->pts + tolerance;
+      const double key = front->dts != DVD_NOPTS_VALUE ? front->dts : front->pts;
+      const auto rpu = m_doviRpus.lower_bound(key - tolerance);
+      const bool found = rpu != m_doviRpus.end() && rpu->first <= key + tolerance;
       // the enhancement layer has the same dts; once it is past, no RPU is coming
       const bool missed = m_doviElDts != DVD_NOPTS_VALUE && m_doviElDts >= front->dts - tolerance;
       if (found || missed || m_doviHeld.size() > maxHeld)
@@ -1726,7 +1728,8 @@ void CDVDDemuxFFmpeg::CreateStreams(unsigned int program)
       for (unsigned int i = 0; i < m_pFormatContext->nb_streams; i++)
       {
         m_pFormatContext->streams[i]->discard = AVDISCARD_NONE;
-        if (GetStream(i) == nullptr)
+        // the hidden enhancement-layer track is still read (see Read)
+        if (GetStream(i) == nullptr && static_cast<int>(i) != m_doviElIndex)
           m_pFormatContext->streams[i]->discard = AVDISCARD_ALL;
       }
     }
@@ -2526,7 +2529,7 @@ bool CDVDDemuxFFmpeg::IsProgramChange()
   for (unsigned int i = 0; i < m_pFormatContext->programs[m_program]->nb_stream_indexes; i++)
   {
     int idx = m_pFormatContext->programs[m_program]->stream_index[i];
-    if (m_pFormatContext->streams[idx]->discard >= AVDISCARD_ALL)
+    if (m_pFormatContext->streams[idx]->discard >= AVDISCARD_ALL || idx == m_doviElIndex)
       continue;
     CDemuxStream* stream = GetStream(idx);
     if (!stream)
@@ -2935,12 +2938,55 @@ StreamHdrType CDVDDemuxFFmpeg::DetermineHdrType(AVStream* pStream)
 
 namespace
 {
-// NAL length size of an hvcC extradata; 0 for Annex B or anything else
+// NAL length size of an hvcC extradata; 0 for Annex B (MPEG-TS) or none
 int HvccLengthSize(const AVCodecParameters* par)
 {
   if (par->extradata_size < 23 || par->extradata[0] != 1)
     return 0;
   return (par->extradata[21] & 3) + 1;
+}
+
+// the NAL units of a packet, length-prefixed (lengthSize > 0) or Annex B (lengthSize 0)
+std::vector<std::pair<const uint8_t*, size_t>> SplitNals(const uint8_t* buf,
+                                                         size_t size,
+                                                         int lengthSize)
+{
+  std::vector<std::pair<const uint8_t*, size_t>> nals;
+  const uint8_t* end = buf + size;
+  if (lengthSize > 0)
+  {
+    while (end - buf > lengthSize)
+    {
+      size_t len = 0;
+      for (int i = 0; i < lengthSize; i++)
+        len = (len << 8) | buf[i];
+      buf += lengthSize;
+      if (len == 0 || len > static_cast<size_t>(end - buf))
+        break;
+      nals.emplace_back(buf, len);
+      buf += len;
+    }
+    return nals;
+  }
+  const uint8_t* nal = nullptr;
+  for (const uint8_t* p = buf; p + 3 <= end; ++p)
+  {
+    if (p[0] == 0 && p[1] == 0 && p[2] == 1)
+    {
+      if (nal)
+      {
+        const uint8_t* e = p;
+        while (e > nal && e[-1] == 0)
+          --e;
+        nals.emplace_back(nal, e - nal);
+      }
+      nal = p + 3;
+      p += 2;
+    }
+  }
+  if (nal && nal < end)
+    nals.emplace_back(nal, end - nal);
+  return nals;
 }
 } // namespace
 
@@ -2950,21 +2996,17 @@ void CDVDDemuxFFmpeg::FindDoviDualTrack()
   m_doviBlIndex = -1;
   m_doviElIndex = -1;
 
-  // a Dolby Vision track without a base layer (profile 7 in MP4: the EL and every frame's RPU)
-  // and a plain HEVC track: the base layer, with HDR10 metadata only. Kodi plays one video
-  // stream, so give the base layer the RPUs and the DOVI configuration; profile 7 then goes
-  // through the profile 8.1 conversion, which drops the EL as for single-track profile 7. Only
-  // with that conversion on: without it the base layer would claim an EL it does not carry.
-  if (!CServiceBroker::GetSettingsComponent()->GetSettings()->GetBool(
-          CSettings::SETTING_VIDEOPLAYER_CONVERTDOVI))
-    return;
-
+  // a Dolby Vision track without a base layer (profile 7 in MP4 or MPEG-TS: the EL and every
+  // frame's RPU) and a plain HEVC track: the base layer, with HDR10 metadata only. Kodi plays one
+  // video stream, so merge the enhancement-layer track into the base layer's packets: with "Dolby
+  // Vision compatibility mode" only the RPUs (the profile 8.1 conversion drops the EL anyway),
+  // without it the whole EL as single-track files carry it, each NAL unit wrapped in a NAL 63.
   int bl = -1;
   int el = -1;
   for (unsigned int i = 0; i < m_pFormatContext->nb_streams; i++)
   {
     const AVCodecParameters* par = m_pFormatContext->streams[i]->codecpar;
-    if (par->codec_id != AV_CODEC_ID_HEVC || HvccLengthSize(par) == 0)
+    if (par->codec_id != AV_CODEC_ID_HEVC)
       continue;
     const AVPacketSideData* sd = av_packet_side_data_get(
         par->coded_side_data, par->nb_coded_side_data, AV_PKT_DATA_DOVI_CONF);
@@ -2988,37 +3030,51 @@ void CDVDDemuxFFmpeg::FindDoviDualTrack()
 
   m_doviBlIndex = bl;
   m_doviElIndex = el;
+  m_doviWithEl = !CServiceBroker::GetSettingsComponent()->GetSettings()->GetBool(
+      CSettings::SETTING_VIDEOPLAYER_CONVERTDOVI);
   m_doviConf.bl_present_flag = 1;
   m_doviLengthSize = HvccLengthSize(m_pFormatContext->streams[bl]->codecpar);
-  CLog::LogF(LOGINFO, "dual-track Dolby Vision profile {}: RPUs of stream {} go to stream {}",
-             m_doviConf.dv_profile, el, bl);
+  m_doviElLengthSize = HvccLengthSize(m_pFormatContext->streams[el]->codecpar);
+  CLog::LogF(LOGINFO, "dual-track Dolby Vision profile {}: {} of stream {} go to stream {}",
+             m_doviConf.dv_profile, m_doviWithEl ? "enhancement layer and RPUs" : "RPUs", el,
+             bl);
 }
 
 void CDVDDemuxFFmpeg::StoreDoviRpu(const AVPacket& pkt, const AVStream* stream)
 {
-  const int lengthSize = HvccLengthSize(stream->codecpar);
-  const uint8_t* buf = pkt.data;
-  const uint8_t* end = pkt.data + pkt.size;
-  while (end - buf > lengthSize)
+  // what gets appended to the base-layer packet, NAL units prefixed in the base layer's format
+  std::vector<uint8_t> out;
+  const auto append = [&](const uint8_t* nal, size_t size, bool wrap)
   {
-    uint32_t size = 0;
-    for (int i = 0; i < lengthSize; i++)
-      size = (size << 8) | buf[i];
-    buf += lengthSize;
-    if (size == 0 || size > static_cast<uint32_t>(end - buf))
-      break;
-    if (((buf[0] >> 1) & 0x3f) == 62) // HEVC_NAL_UNSPEC62: Dolby Vision RPU
-    {
-      const double pts = ConvertTimestamp(pkt.pts, stream->time_base.den, stream->time_base.num);
-      if (pts != DVD_NOPTS_VALUE)
-        m_doviRpus[pts].assign(buf, buf + size);
-      break;
-    }
-    buf += size;
+    const size_t total = size + (wrap ? 2 : 0);
+    if (m_doviLengthSize > 0)
+      for (int i = m_doviLengthSize - 1; i >= 0; i--)
+        out.push_back(static_cast<uint8_t>(total >> (8 * i)));
+    else
+      out.insert(out.end(), {0, 0, 0, 1});
+    if (wrap)
+      out.insert(out.end(), {0x7e, 0x01}); // NAL 63, as single-track dual-layer streams have it
+    out.insert(out.end(), nal, nal + size);
+  };
+  for (const auto& [nal, size] : SplitNals(pkt.data, pkt.size, m_doviElLengthSize))
+  {
+    if (size < 2)
+      continue;
+    if (((nal[0] >> 1) & 0x3f) == 62) // HEVC_NAL_UNSPEC62: Dolby Vision RPU
+      append(nal, size, false);
+    else if (m_doviWithEl)
+      append(nal, size, true);
   }
-  m_doviElDts = ConvertTimestamp(pkt.dts, stream->time_base.den, stream->time_base.num);
+  const double dts = ConvertTimestamp(pkt.dts, stream->time_base.den, stream->time_base.num);
+  const double key =
+      dts != DVD_NOPTS_VALUE
+          ? dts
+          : ConvertTimestamp(pkt.pts, stream->time_base.den, stream->time_base.num);
+  if (key != DVD_NOPTS_VALUE && !out.empty())
+    m_doviRpus[key] = std::move(out);
+  m_doviElDts = dts;
 
-  // RPUs of base-layer packets that never came (discarded at speed), oldest pts first
+  // frames of base-layer packets that never came (discarded at speed), oldest pts first
   while (m_doviRpus.size() > 1000)
     m_doviRpus.erase(m_doviRpus.begin());
 }
@@ -3026,25 +3082,23 @@ void CDVDDemuxFFmpeg::StoreDoviRpu(const AVPacket& pkt, const AVStream* stream)
 void CDVDDemuxFFmpeg::AttachDoviRpu(DemuxPacket* pkt)
 {
   constexpr double tolerance = DVD_MSEC_TO_TIME(1);
-  const auto rpu = m_doviRpus.lower_bound(pkt->pts - tolerance);
-  if (rpu == m_doviRpus.end() || rpu->first > pkt->pts + tolerance)
+  const double key = pkt->dts != DVD_NOPTS_VALUE ? pkt->dts : pkt->pts;
+  const auto rpu = m_doviRpus.lower_bound(key - tolerance);
+  if (rpu == m_doviRpus.end() || rpu->first > key + tolerance)
   {
-    CLog::LogF(LOGDEBUG, "no RPU for base-layer pts {:.3f}", pkt->pts / DVD_TIME_BASE);
+    CLog::LogF(LOGDEBUG, "no enhancement layer for base-layer dts {:.3f}", key / DVD_TIME_BASE);
     return;
   }
 
-  // append it as one more NAL unit of the access unit, where single-track files carry it
-  const std::vector<uint8_t>& nal = rpu->second;
-  const int size = pkt->iSize + m_doviLengthSize + static_cast<int>(nal.size());
+  // append it to the access unit, where single-track files carry it
+  const std::vector<uint8_t>& extra = rpu->second;
+  const int size = pkt->iSize + static_cast<int>(extra.size());
   auto* data =
       static_cast<uint8_t*>(KODI::MEMORY::AlignedMalloc(size + AV_INPUT_BUFFER_PADDING_SIZE, 16));
   if (data)
   {
     std::memcpy(data, pkt->pData, pkt->iSize);
-    uint8_t* p = data + pkt->iSize;
-    for (int i = m_doviLengthSize - 1; i >= 0; i--)
-      *p++ = static_cast<uint8_t>(nal.size() >> (8 * i));
-    std::memcpy(p, nal.data(), nal.size());
+    std::memcpy(data + pkt->iSize, extra.data(), extra.size());
     std::memset(data + size, 0, AV_INPUT_BUFFER_PADDING_SIZE);
     KODI::MEMORY::AlignedFree(pkt->pData);
     pkt->pData = data;

@@ -209,9 +209,11 @@ protected:
 
   int m_doviBlIndex = -1; // played stream that gets the RPUs
   int m_doviElIndex = -1; // hidden stream they come from
-  int m_doviLengthSize = 4; // NAL length size of the base layer's hvcC
+  int m_doviLengthSize = 4; // NAL length size of the base layer's hvcC, 0 for Annex B
+  int m_doviElLengthSize = 4; // the same for the enhancement-layer track
+  bool m_doviWithEl = false; // merge the whole EL, not only the RPUs (no P7 -> 8.1 conversion)
   AVDOVIDecoderConfigurationRecord m_doviConf{};
-  std::map<double, std::vector<uint8_t>> m_doviRpus; // pts -> RPU NAL, no length prefix
+  std::map<double, std::vector<uint8_t>> m_doviRpus; // dts -> EL NAL units to append, prefixed
   double m_doviElDts = DVD_NOPTS_VALUE; // last enhancement-layer dts read
   bool m_doviElRead = false; // ReadInternal consumed an enhancement-layer packet
   std::deque<DemuxPacket*> m_doviHeld; // base-layer packets waiting for their RPU
