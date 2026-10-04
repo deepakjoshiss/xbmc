@@ -501,6 +501,7 @@ void CBitstreamConverter::Close()
 {
   if (m_sps_pps_context.sps_pps_data)
     av_free(m_sps_pps_context.sps_pps_data), m_sps_pps_context.sps_pps_data = NULL;
+  m_inbandParamSets = {};
 
   if (m_convertBuffer)
     av_free(m_convertBuffer), m_convertBuffer = NULL;
@@ -941,6 +942,20 @@ bool CBitstreamConverter::BitstreamConvert(uint8_t* pData,
     if (m_sps_pps_context.first_idr && (unit_type == nal_sps || unit_type == nal_pps))
       m_sps_pps_context.idr_sps_pps_seen = 1;
 
+    // hev1/avc3 extradata may carry no parameter sets, and some files (The Last Jedi UHD) then
+    // have them in-band only at the start: keep them to prepend after ResetStartDecode. Only the
+    // last set of each type is kept; a stream switching between several SPS/PPS ids would need
+    // one per id.
+    if (!m_sps_pps_context.size)
+    {
+      if (unit_type == nal_sps)
+        m_inbandParamSets[1].assign(buf, buf + nal_size);
+      else if (unit_type == nal_pps)
+        m_inbandParamSets[2].assign(buf, buf + nal_size);
+      else if (m_codec == AV_CODEC_ID_HEVC && unit_type == HEVC_NAL_VPS)
+        m_inbandParamSets[0].assign(buf, buf + nal_size);
+    }
+
     if (!m_start_decode && (unit_type == nal_sps || IsIDR(unit_type) ||
                             (unit_type == nal_sei && has_sei_recovery_point(buf, buf + nal_size))))
       m_start_decode = true;
@@ -948,8 +963,23 @@ bool CBitstreamConverter::BitstreamConvert(uint8_t* pData,
     // prepend only to the first access unit of an IDR picture, if no sps/pps already present
     if (m_sps_pps_context.first_idr && IsIDR(unit_type) && !m_sps_pps_context.idr_sps_pps_seen)
     {
-      BitstreamAllocAndCopy(poutbuf, poutbuf_size, m_sps_pps_context.sps_pps_data,
-                            m_sps_pps_context.size, buf, nal_size, unit_type);
+      const uint8_t* sps_pps = m_sps_pps_context.sps_pps_data;
+      uint32_t sps_pps_size = m_sps_pps_context.size;
+      std::vector<uint8_t> inband;
+      if (!sps_pps_size)
+      {
+        for (const auto& set : m_inbandParamSets)
+        {
+          if (set.empty())
+            continue;
+          inband.insert(inband.end(), {0, 0, 0, 1});
+          inband.insert(inband.end(), set.begin(), set.end());
+        }
+        sps_pps = inband.data();
+        sps_pps_size = static_cast<uint32_t>(inband.size());
+      }
+      BitstreamAllocAndCopy(poutbuf, poutbuf_size, sps_pps, sps_pps_size, buf, nal_size,
+                            unit_type);
       m_sps_pps_context.first_idr = 0;
     }
     else

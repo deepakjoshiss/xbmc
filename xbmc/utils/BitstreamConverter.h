@@ -10,7 +10,9 @@
 
 #include "cores/FFmpeg.h"
 
+#include <array>
 #include <stdint.h>
+#include <vector>
 
 extern "C"
 {
@@ -150,6 +152,8 @@ protected:
 
   uint32_t m_sps_pps_size;
   omx_bitstream_ctx m_sps_pps_context;
+  // the stream's latest in-band VPS, SPS and PPS, kept when the extradata has none
+  std::array<std::vector<uint8_t>, 3> m_inbandParamSets;
   bool m_convert_bitstream;
   bool m_to_annexb;
 
