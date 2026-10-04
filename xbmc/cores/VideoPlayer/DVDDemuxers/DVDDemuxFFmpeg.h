@@ -9,8 +9,10 @@
 #pragma once
 
 #include "DVDDemux.h"
+#include "cores/VideoPlayer/Interface/TimingConstants.h"
 #include "threads/CriticalSection.h"
 #include "threads/SystemClock.h"
+#include <deque>
 #include <map>
 #include <memory>
 #include <vector>
@@ -149,6 +151,12 @@ protected:
 
   StreamHdrType DetermineHdrType(AVStream* pStream);
 
+  // Dolby Vision with the base layer and the enhancement layer + RPUs in separate tracks (MP4)
+  void FindDoviDualTrack();
+  void StoreDoviRpu(const AVPacket& pkt, const AVStream* stream);
+  void AttachDoviRpu(DemuxPacket* pkt);
+  void ClearDoviHeld();
+
   CCriticalSection m_critSection;
   std::map<int, CDemuxStream*> m_streams;
   std::map<int, std::unique_ptr<CDemuxParserFFmpeg>> m_parsers;
@@ -198,6 +206,15 @@ protected:
   int m_displayTime = 0;
   double m_dtsAtDisplayTime;
   bool m_seekToKeyFrame = false;
+
+  int m_doviBlIndex = -1; // played stream that gets the RPUs
+  int m_doviElIndex = -1; // hidden stream they come from
+  int m_doviLengthSize = 4; // NAL length size of the base layer's hvcC
+  AVDOVIDecoderConfigurationRecord m_doviConf{};
+  std::map<double, std::vector<uint8_t>> m_doviRpus; // pts -> RPU NAL, no length prefix
+  double m_doviElDts = DVD_NOPTS_VALUE; // last enhancement-layer dts read
+  bool m_doviElRead = false; // ReadInternal consumed an enhancement-layer packet
+  std::deque<DemuxPacket*> m_doviHeld; // base-layer packets waiting for their RPU
   double m_startTime = 0;
   std::vector<ChapterFFmpeg> m_chapters;
 };
