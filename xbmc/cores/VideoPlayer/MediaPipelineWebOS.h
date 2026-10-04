@@ -81,12 +81,16 @@ public:
    */
   void Checkpoint()
   {
-    if (m_pauseRequested.load(std::memory_order_acquire))
+    // Loop: a Pause() that lands while this worker is waking from the last one finds m_paused
+    // still true and returns at once, so the worker must park again rather than run on.
+    // seq_cst: this "clear m_paused, then read the request" pairs with Pause()'s "set the
+    // request, then read m_paused" (Dekker); acquire/release alone lets both read stale values.
+    while (m_pauseRequested.load())
     {
       m_paused.store(true, std::memory_order_release);
       m_paused.notify_all();
       m_pauseRequested.wait(true, std::memory_order_acquire);
-      m_paused.store(false, std::memory_order_release);
+      m_paused.store(false);
     }
   }
 
@@ -106,21 +110,28 @@ public:
    *
    * Must be set to \c true before the worker loop and \c false after.
    */
-  void SetRunning(const bool running) { m_running.store(running, std::memory_order_release); }
+  void SetRunning(const bool running)
+  {
+    if (running)
+      m_paused.store(false, std::memory_order_release);
+    m_running.store(running, std::memory_order_release);
+  }
 
 private:
   void Pause()
   {
-    m_pauseRequested.store(true, std::memory_order_release);
+    m_pauseRequested.store(true);
     if (m_running.load(std::memory_order_acquire))
-      m_paused.wait(false, std::memory_order_acquire);
+      m_paused.wait(false);
   }
 
+  // Only the worker clears m_paused, when it leaves Checkpoint(). Clearing it here too let a
+  // Pause() right behind this Resume() (Load, then Flush on an audio switch) wait for an
+  // m_paused the still-parked worker would never set again: both sides blocked for good.
   void Resume()
   {
     m_pauseRequested.store(false, std::memory_order_release);
     m_pauseRequested.notify_all();
-    m_paused.store(false, std::memory_order_release);
   }
 
   std::atomic<bool> m_pauseRequested{false};
