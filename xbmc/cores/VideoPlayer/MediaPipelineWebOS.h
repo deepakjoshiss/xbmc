@@ -20,10 +20,13 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <deque>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include <starfish-media-pipeline/StarfishMediaAPIs.h>
@@ -503,6 +506,8 @@ private:
 
   bool m_dualLayer{false}; // Dolby Vision profile 7 fed with its enhancement layer
   std::vector<uint8_t> m_dualLayerBuffer;
+  // where au_cpb_removal_delay_minus1 sits in EL picture timing SEIs, from the EL SPS
+  std::optional<std::pair<unsigned int, unsigned int>> m_elCpbDelay; // bit offset, length
   std::atomic<bool> m_subtitle{false};
   std::atomic<double> m_subtitleDelay{0.0};
   std::atomic<bool> m_needsTranscode{false};

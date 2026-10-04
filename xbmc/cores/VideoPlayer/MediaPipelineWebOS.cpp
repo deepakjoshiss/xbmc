@@ -27,6 +27,7 @@
 #include "cores/AudioEngine/Utils/AEStreamInfo.h"
 #include "cores/AudioEngine/Utils/AEUtil.h"
 #include "cores/VideoPlayer/Interface/DemuxCrypto.h"
+#include "filesystem/bluray/BitReader.h"
 #include "settings/SettingUtils.h"
 #include "settings/Settings.h"
 #include "settings/SettingsComponent.h"
@@ -44,9 +45,11 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <exception>
 #include <map>
+#include <optional>
 #include <ranges>
 #include <ratio>
 #include <string_view>
@@ -642,6 +645,8 @@ bool CMediaPipelineWebOS::Load(CDVDStreamInfo videoHint, CDVDStreamInfo audioHin
 
   SetupBitstreamConverter(videoHint);
   CVariant& contents = p["option"]["externalStreamingInfo"]["contents"];
+  m_dualLayer = false;
+  m_elCpbDelay.reset();
   if (videoHint.hdrType == StreamHdrType::HDR_TYPE_DOLBYVISION)
   {
     contents["DolbyHdrInfo"]["encryptionType"] = videoHint.cryptoSession ? "all" : "clear";
@@ -975,6 +980,283 @@ std::string CMediaPipelineWebOS::SetupAudio(CDVDStreamInfo& audioHint, CVariant&
   return codecName;
 }
 
+namespace
+{
+// Where au_cpb_removal_delay_minus1 sits in an enhancement-layer picture timing SEI payload (H.265
+// D.2.3), from the EL's SPS: after pic_struct, source_scan_type and duplicate_flag (7 bits) when
+// frame_field_info_present_flag, as many bits as the HRD's au_cpb_removal_delay_length_minus1 + 1,
+// and only present with NAL or VCL HRD parameters.
+struct PicTimingCpbDelay
+{
+  unsigned int offset{0};
+  unsigned int length{0};
+};
+
+std::vector<std::byte> Unescape(const uint8_t* p, size_t size)
+{
+  std::vector<std::byte> rbsp;
+  rbsp.reserve(size);
+  for (size_t i = 0, zeros = 0; i < size; ++i)
+  {
+    if (zeros >= 2 && p[i] == 3)
+    {
+      zeros = 0;
+      continue;
+    }
+    zeros = p[i] == 0 ? zeros + 1 : 0;
+    rbsp.push_back(static_cast<std::byte>(p[i]));
+  }
+  return rbsp;
+}
+
+std::vector<uint8_t> Escape(const std::vector<std::byte>& rbsp)
+{
+  std::vector<uint8_t> out;
+  out.reserve(rbsp.size() + 8);
+  for (size_t i = 0, zeros = 0; i < rbsp.size(); ++i)
+  {
+    const auto b = std::to_integer<uint8_t>(rbsp[i]);
+    if (zeros >= 2 && b <= 3)
+    {
+      out.push_back(3);
+      zeros = 0;
+    }
+    zeros = b == 0 ? zeros + 1 : 0;
+    out.push_back(b);
+  }
+  return out;
+}
+
+// sps: the SPS NAL unit including its 2-byte header
+std::optional<PicTimingCpbDelay> ParseSpsPicTimingCpbDelay(const uint8_t* sps, size_t size)
+{
+  if (size < 3)
+    return std::nullopt;
+  const std::vector<std::byte> rbsp = Unescape(sps + 2, size - 2);
+  try
+  {
+    BitReader br(rbsp);
+    br.SkipBits(4); // sps_video_parameter_set_id
+    const unsigned int maxSubLayersMinus1 = br.ReadBits(3);
+    br.SkipBits(1); // sps_temporal_id_nesting_flag
+    // profile_tier_level(1, maxSubLayersMinus1)
+    br.SkipBits(88);
+    br.SkipBits(8); // general_level_idc
+    std::vector<bool> profilePresent(maxSubLayersMinus1), levelPresent(maxSubLayersMinus1);
+    for (unsigned int i = 0; i < maxSubLayersMinus1; i++)
+    {
+      profilePresent[i] = br.ReadBits(1);
+      levelPresent[i] = br.ReadBits(1);
+    }
+    if (maxSubLayersMinus1 > 0)
+      br.SkipBits((8 - maxSubLayersMinus1) * 2);
+    for (unsigned int i = 0; i < maxSubLayersMinus1; i++)
+    {
+      if (profilePresent[i])
+        br.SkipBits(88);
+      if (levelPresent[i])
+        br.SkipBits(8);
+    }
+    br.SkipUE(); // sps_seq_parameter_set_id
+    if (br.ReadUE() == 3) // chroma_format_idc
+      br.SkipBits(1); // separate_colour_plane_flag
+    br.SkipUE(); // pic_width_in_luma_samples
+    br.SkipUE(); // pic_height_in_luma_samples
+    if (br.ReadBits(1)) // conformance_window_flag
+      for (int i = 0; i < 4; i++)
+        br.SkipUE();
+    br.SkipUE(); // bit_depth_luma_minus8
+    br.SkipUE(); // bit_depth_chroma_minus8
+    const unsigned int log2MaxPocLsb = br.ReadUE() + 4;
+    const bool orderingInfo = br.ReadBits(1);
+    for (unsigned int i = orderingInfo ? 0 : maxSubLayersMinus1; i <= maxSubLayersMinus1; i++)
+      for (int j = 0; j < 3; j++)
+        br.SkipUE(); // max_dec_pic_buffering_minus1, max_num_reorder_pics, max_latency_increase
+    for (int i = 0; i < 6; i++)
+      br.SkipUE(); // coding/transform block sizes and hierarchy depths
+    if (br.ReadBits(1) && br.ReadBits(1)) // scaling_list_enabled, sps_scaling_list_data_present
+    {
+      for (unsigned int sizeId = 0; sizeId < 4; sizeId++)
+        for (unsigned int matrixId = 0; matrixId < (sizeId == 3 ? 2u : 6u); matrixId++)
+        {
+          if (!br.ReadBits(1)) // scaling_list_pred_mode_flag
+            br.SkipUE(); // scaling_list_pred_matrix_id_delta
+          else
+          {
+            const int coefNum = std::min(64, 1 << (4 + (sizeId << 1)));
+            if (sizeId > 1)
+              br.SkipSE(); // scaling_list_dc_coef_minus8
+            for (int k = 0; k < coefNum; k++)
+              br.SkipSE(); // scaling_list_delta_coef
+          }
+        }
+    }
+    br.SkipBits(2); // amp_enabled_flag, sample_adaptive_offset_enabled_flag
+    if (br.ReadBits(1)) // pcm_enabled_flag
+    {
+      br.SkipBits(8);
+      br.SkipUE();
+      br.SkipUE();
+      br.SkipBits(1);
+    }
+    // st_ref_pic_set(i) (7.3.7); a predicted set's NumDeltaPocs counts its used/use_delta flags.
+    // The counts come from the file and BitReader reads zeros past its end without throwing:
+    // above the spec's limits (7.4.3.2.1, 7.4.8) give up rather than allocate or loop for ever.
+    const unsigned int numSets = br.ReadUE();
+    if (numSets > 64)
+      return std::nullopt;
+    std::vector<unsigned int> numDeltaPocs(numSets);
+    for (unsigned int idx = 0; idx < numSets; idx++)
+    {
+      if (idx != 0 && br.ReadBits(1)) // inter_ref_pic_set_prediction_flag
+      {
+        br.SkipBits(1); // delta_rps_sign
+        br.SkipUE(); // abs_delta_rps_minus1
+        unsigned int count = 0;
+        for (unsigned int j = 0; j <= numDeltaPocs[idx - 1]; j++)
+        {
+          const bool used = br.ReadBits(1);
+          if (used || br.ReadBits(1)) // use_delta_flag
+            count++;
+        }
+        numDeltaPocs[idx] = count;
+      }
+      else
+      {
+        const unsigned int negative = br.ReadUE();
+        const unsigned int positive = br.ReadUE();
+        if (negative > 16 || positive > 16)
+          return std::nullopt;
+        for (unsigned int k = 0; k < negative + positive; k++)
+        {
+          br.SkipUE(); // delta_poc_minus1
+          br.SkipBits(1); // used_by_curr_pic_flag
+        }
+        numDeltaPocs[idx] = negative + positive;
+      }
+    }
+    if (br.ReadBits(1)) // long_term_ref_pics_present_flag
+    {
+      const unsigned int numLongTerm = br.ReadUE();
+      if (numLongTerm > 32)
+        return std::nullopt;
+      for (unsigned int i = 0; i < numLongTerm; i++)
+        br.SkipBits(log2MaxPocLsb + 1); // lt_ref_pic_poc_lsb_sps, used_by_curr_pic_lt_sps_flag
+    }
+    br.SkipBits(2); // sps_temporal_mvp_enabled_flag, strong_intra_smoothing_enabled_flag
+    if (!br.ReadBits(1)) // vui_parameters_present_flag
+      return std::nullopt;
+    if (br.ReadBits(1) && br.ReadBits(8) == 255) // aspect_ratio_info_present, idc: EXTENDED_SAR
+      br.SkipBits(32);
+    if (br.ReadBits(1)) // overscan_info_present_flag
+      br.SkipBits(1);
+    if (br.ReadBits(1)) // video_signal_type_present_flag
+    {
+      br.SkipBits(4); // video_format, video_full_range_flag
+      if (br.ReadBits(1)) // colour_description_present_flag
+        br.SkipBits(24);
+    }
+    if (br.ReadBits(1)) // chroma_loc_info_present_flag
+    {
+      br.SkipUE();
+      br.SkipUE();
+    }
+    br.SkipBits(2); // neutral_chroma_indication_flag, field_seq_flag
+    const bool frameFieldInfo = br.ReadBits(1);
+    if (br.ReadBits(1)) // default_display_window_flag
+      for (int i = 0; i < 4; i++)
+        br.SkipUE();
+    if (!br.ReadBits(1)) // vui_timing_info_present_flag
+      return std::nullopt;
+    br.SkipBits(32); // vui_num_units_in_tick
+    br.SkipBits(32); // vui_time_scale
+    if (br.ReadBits(1)) // vui_poc_proportional_to_timing_flag
+      br.SkipUE();
+    if (!br.ReadBits(1)) // vui_hrd_parameters_present_flag
+      return std::nullopt;
+    // hrd_parameters(1, maxSubLayersMinus1), common part (E.2.2)
+    const bool nalHrd = br.ReadBits(1);
+    const bool vclHrd = br.ReadBits(1);
+    if (!nalHrd && !vclHrd)
+      return std::nullopt; // CpbDpbDelaysPresentFlag 0: no au_cpb_removal_delay_minus1
+    const bool subPicHrd = br.ReadBits(1);
+    if (subPicHrd)
+      br.SkipBits(8 + 5 + 1 + 5); // tick_divisor, du delay length, in_pic_timing_sei, du out len
+    br.SkipBits(8); // bit_rate_scale, cpb_size_scale
+    if (subPicHrd)
+      br.SkipBits(4); // cpb_size_du_scale
+    br.SkipBits(5); // initial_cpb_removal_delay_length_minus1
+    const unsigned int length = br.ReadBits(5) + 1; // au_cpb_removal_delay_length_minus1
+    return PicTimingCpbDelay{frameFieldInfo ? 7u : 0u, length};
+  }
+  catch (const std::out_of_range&)
+  {
+    return std::nullopt;
+  }
+}
+
+// At an enhancement-layer CRA the TV's Dolby VES splitter adds the picture timing SEI's
+// au_cpb_removal_delay_minus1 to its EL clock on top of the POC it already counts, so the EL runs
+// ahead of the base layer until the next IDR and none of its pictures pair. Zero that field in
+// the EL CRA's picture timing SEI. Returns whether the access unit was changed.
+bool ZeroElCraCpbRemovalDelay(std::vector<uint8_t>& au, const PicTimingCpbDelay& field)
+{
+  std::vector<size_t> starts;
+  for (size_t i = 0; i + 3 <= au.size(); ++i)
+    if (au[i] == 0 && au[i + 1] == 0 && au[i + 2] == 1)
+      starts.push_back(i + 3);
+  bool cra = false;
+  for (size_t s : starts)
+    if (s + 2 < au.size() && au[s] == 0x7e && ((au[s + 2] >> 1) & 0x3f) == 21)
+      cra = true;
+  if (!cra)
+    return false;
+
+  for (size_t n = 0; n < starts.size(); ++n)
+  {
+    const size_t s = starts[n];
+    // NAL 63 wrapping a prefix SEI (type 39)
+    if (s + 4 > au.size() || au[s] != 0x7e || ((au[s + 2] >> 1) & 0x3f) != 39)
+      continue;
+    size_t e = n + 1 < starts.size() ? starts[n + 1] - 3 : au.size();
+    while (n + 1 < starts.size() && e > s && au[e - 1] == 0)
+      --e;
+    if (e < s + 4) // no payload (malformed): e - (s + 4) would wrap and Unescape throw
+      continue;
+    std::vector<std::byte> rbsp = Unescape(au.data() + s + 4, e - (s + 4));
+    // sei_message()s: payload type and size as runs of 0xFF plus a last byte
+    size_t pos = 0;
+    while (pos < rbsp.size() && std::to_integer<uint8_t>(rbsp[pos]) != 0x80)
+    {
+      unsigned int type = 0, payloadSize = 0;
+      while (pos < rbsp.size() && std::to_integer<uint8_t>(rbsp[pos]) == 0xff)
+        type += 255, pos++;
+      if (pos >= rbsp.size())
+        break;
+      type += std::to_integer<uint8_t>(rbsp[pos++]);
+      while (pos < rbsp.size() && std::to_integer<uint8_t>(rbsp[pos]) == 0xff)
+        payloadSize += 255, pos++;
+      if (pos >= rbsp.size())
+        break;
+      payloadSize += std::to_integer<uint8_t>(rbsp[pos++]);
+      if (pos + payloadSize > rbsp.size())
+        break;
+      if (type == 1 && (field.offset + field.length + 7) / 8 <= payloadSize)
+      {
+        for (unsigned int bit = field.offset; bit < field.offset + field.length; bit++)
+          rbsp[pos + bit / 8] &= static_cast<std::byte>(~(0x80u >> (bit % 8)));
+        const std::vector<uint8_t> escaped = Escape(rbsp);
+        au.erase(au.begin() + s + 4, au.begin() + e);
+        au.insert(au.begin() + s + 4, escaped.begin(), escaped.end());
+        return true;
+      }
+      pos += payloadSize;
+    }
+  }
+  return false;
+}
+} // namespace
+
 void CMediaPipelineWebOS::SetupBitstreamConverter(CDVDStreamInfo& hint)
 {
   const std::shared_ptr<CSettings> settings = CServiceBroker::GetSettingsComponent()->GetSettings();
@@ -1284,6 +1566,37 @@ bool CMediaPipelineWebOS::FeedVideoData(const std::shared_ptr<CDVDMsg>& msg)
         m_dualLayerBuffer.assign(data, data + firstEl);
         m_dualLayerBuffer.insert(m_dualLayerBuffer.end(), std::begin(aud), std::end(aud));
         m_dualLayerBuffer.insert(m_dualLayerBuffer.end(), data + firstEl, data + size);
+        data = m_dualLayerBuffer.data();
+        size = m_dualLayerBuffer.size();
+      }
+      // the EL's SPS comes in-band at its IRAPs, wrapped in NAL 63
+      for (size_t i = 0; i + 5 < size; ++i)
+      {
+        if (data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1 && data[i + 3] == 0x7e &&
+            ((data[i + 5] >> 1) & 0x3f) == 33)
+        {
+          size_t e = i + 3;
+          while (e + 3 <= size && !(data[e] == 0 && data[e + 1] == 0 && data[e + 2] == 1))
+            ++e;
+          if (e + 3 > size)
+            e = size;
+          const auto parsed = ParseSpsPicTimingCpbDelay(data + i + 5, e - (i + 5));
+          std::optional<std::pair<unsigned int, unsigned int>> field;
+          if (parsed)
+            field = std::make_pair(parsed->offset, parsed->length);
+          if (field != m_elCpbDelay)
+            CLog::LogF(LOGINFO, "enhancement layer: au_cpb_removal_delay_minus1 {}",
+                       field ? fmt::format("at bit {}, {} bits", field->first, field->second)
+                             : "not present");
+          m_elCpbDelay = field;
+          break;
+        }
+      }
+      if (m_elCpbDelay)
+      {
+        if (data != m_dualLayerBuffer.data())
+          m_dualLayerBuffer.assign(data, data + size);
+        ZeroElCraCpbRemovalDelay(m_dualLayerBuffer, {m_elCpbDelay->first, m_elCpbDelay->second});
         data = m_dualLayerBuffer.data();
         size = m_dualLayerBuffer.size();
       }
