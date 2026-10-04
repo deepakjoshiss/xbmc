@@ -347,6 +347,11 @@ bool CMediaPipelineWebOS::OpenAudioStream(CDVDStreamInfo& audioHint)
     Unload(true);
 
     m_mediaAPIs = std::make_unique<StarfishMediaAPIs>();
+    // VideoPlayer seeks right after a stream change. Packets still queued from before it are
+    // mid-GOP for the new decoder; fed, they make the coming flush hit a pipeline that has data
+    // but no picture yet, and starfish then refuses the keyframe (picture frozen to the next).
+    FlushAudioMessages();
+    FlushVideoMessages();
     m_audioClosed = false;
   }
 
@@ -434,7 +439,10 @@ void CMediaPipelineWebOS::Flush(bool sync)
   CWorkerGate::Lock videoLock(m_videoGate);
   CWorkerGate::Lock audioLock(m_audioGate);
 
-  if (!m_mediaAPIs->flush())
+  // Nothing has been fed since the last load or flush (audio waits for the first video packet),
+  // so there is nothing to flush; and flushing a pipeline that has not started yet gets the
+  // next submits refused (the keyframe among them).
+  if (!m_flushed && !m_mediaAPIs->flush())
     CLog::LogF(LOGDEBUG, "Failed to flush media APIs");
   FlushAudioMessages();
   FlushVideoMessages();
