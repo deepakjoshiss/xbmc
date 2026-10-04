@@ -17,6 +17,7 @@
 #include "threads/Thread.h"
 #include "utils/BitstreamStats.h"
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -508,7 +509,13 @@ private:
   std::vector<uint8_t> m_dualLayerBuffer;
   std::atomic<bool> m_waitForElIdr{true}; // dual layer: video waits for an EL IDR
   std::atomic<std::chrono::nanoseconds> m_skippedVideoPts{NO_PTS};
+  bool m_waitForBlIrap{true}; // then parameter sets go into the first base-layer IRAP
   unsigned int m_droppedForElIdr{0};
+  std::array<std::vector<uint8_t>, 3> m_blParamSets; // latest VPS, SPS, PPS, Annex B
+  std::array<std::vector<uint8_t>, 3> m_elParamSets; // the same for the EL, wrapped in NAL 63
+  std::vector<uint8_t> m_elBufferingPeriod; // EL buffering period SEI, wrapped
+  bool m_zeroElCpbDelay{false};
+  std::vector<uint8_t> m_dualLayerStart;
   // where au_cpb_removal_delay_minus1 sits in EL picture timing SEIs, from the EL SPS
   std::optional<std::pair<unsigned int, unsigned int>> m_elCpbDelay; // bit offset, length
   std::atomic<bool> m_subtitle{false};

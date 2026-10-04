@@ -452,6 +452,7 @@ void CMediaPipelineWebOS::Flush(bool sync)
   if (m_bitstream)
     m_bitstream->ResetStartDecode();
   m_waitForElIdr = true;
+  m_waitForBlIrap = true;
   m_droppedForElIdr = 0;
   m_skippedVideoPts = NO_PTS;
   m_fedAudioPts = NO_PTS;
@@ -650,7 +651,13 @@ bool CMediaPipelineWebOS::Load(CDVDStreamInfo videoHint, CDVDStreamInfo audioHin
   CVariant& contents = p["option"]["externalStreamingInfo"]["contents"];
   m_dualLayer = false;
   m_elCpbDelay.reset();
+  for (auto& set : m_blParamSets)
+    set.clear();
+  for (auto& set : m_elParamSets)
+    set.clear();
+  m_elBufferingPeriod.clear();
   m_waitForElIdr = true;
+  m_waitForBlIrap = true;
   m_droppedForElIdr = 0;
   m_skippedVideoPts = NO_PTS;
   if (videoHint.hdrType == StreamHdrType::HDR_TYPE_DOLBYVISION)
@@ -1205,7 +1212,9 @@ std::optional<PicTimingCpbDelay> ParseSpsPicTimingCpbDelay(const uint8_t* sps, s
 // au_cpb_removal_delay_minus1 to its EL clock on top of the POC it already counts, so the EL runs
 // ahead of the base layer until the next IDR and none of its pictures pair. Zero that field in
 // the EL CRA's picture timing SEI. Returns whether the access unit was changed.
-bool ZeroElCraCpbRemovalDelay(std::vector<uint8_t>& au, const PicTimingCpbDelay& field)
+bool ZeroElCraCpbRemovalDelay(std::vector<uint8_t>& au,
+                              const PicTimingCpbDelay& field,
+                              bool anyPicture = false)
 {
   std::vector<size_t> starts;
   for (size_t i = 0; i + 3 <= au.size(); ++i)
@@ -1215,7 +1224,7 @@ bool ZeroElCraCpbRemovalDelay(std::vector<uint8_t>& au, const PicTimingCpbDelay&
   for (size_t s : starts)
     if (s + 2 < au.size() && au[s] == 0x7e && ((au[s + 2] >> 1) & 0x3f) == 21)
       cra = true;
-  if (!cra)
+  if (!cra && !anyPicture)
     return false;
 
   for (size_t n = 0; n < starts.size(); ++n)
@@ -1502,27 +1511,113 @@ bool CMediaPipelineWebOS::FeedVideoData(const std::shared_ptr<CDVDMsg>& msg)
   // The TV's Dolby VES splitter sets up its enhancement-layer clock only at an EL IDR: started
   // (load, seek) at a CRA it times the EL from a stale or zero base and no EL picture ever pairs.
   // Start dual-layer feeding at the first access unit whose EL picture is an IDR.
-  if (m_dualLayer && m_waitForElIdr && data && size)
+  // After a flush the splitter itself also skips everything up to the next base-layer IRAP. Where
+  // the layers do not put their IRAPs on the same pictures (test files) the EL picture there has
+  // no parameter set the splitter has seen since its reset, and it activates an SPS only from a
+  // buffering period SEI: without one its picture timing parse dereferences a null SPS (a crash).
+  // Give that access unit both layers' last parameter sets and the EL's last buffering period.
+  if (m_dualLayer && (m_waitForElIdr || m_waitForBlIrap) && data && size)
   {
-    int elType = -1;
-    for (size_t i = 0; i + 5 < size; ++i)
+    // NAL units: [begin of start code, first byte of the NAL, end)
+    struct Nal
     {
-      if (data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1 && data[i + 3] == 0x7e &&
-          ((data[i + 5] >> 1) & 0x3f) < 32)
+      size_t begin, nal, end;
+    };
+    std::vector<Nal> nals;
+    for (size_t i = 0; i + 3 <= size; ++i)
+    {
+      if (data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1)
       {
-        elType = (data[i + 5] >> 1) & 0x3f;
-        break;
+        const size_t begin = (i > 0 && data[i - 1] == 0) ? i - 1 : i;
+        if (!nals.empty())
+          nals.back().end = begin;
+        nals.push_back({begin, i + 3, size});
+        i += 2;
       }
     }
-    if (elType != 19 && elType != 20 && ++m_droppedForElIdr < 400)
+    int elType = -1;
+    int blType = -1;
+    bool blSps = false;
+    bool elSps = false;
+    for (const Nal& n : nals)
     {
-      m_skippedVideoPts = pts;
-      return true;
+      if (n.end - n.nal < 3)
+        continue;
+      const int type = (data[n.nal] >> 1) & 0x3f;
+      const int inner = (data[n.nal + 2] >> 1) & 0x3f;
+      // remember the latest parameter sets of both layers (the EL's still wrapped in NAL 63)
+      if (type >= 32 && type <= 34)
+      {
+        m_blParamSets[type - 32].assign(data + n.begin, data + n.end);
+        blSps |= type == 33;
+      }
+      else if (type == 63 && inner >= 32 && inner <= 34)
+      {
+        m_elParamSets[inner - 32].assign(data + n.begin, data + n.end);
+        elSps |= inner == 33;
+      }
+      else if (type == 63 && inner == 39 && n.end - n.nal > 4 && data[n.nal + 4] == 0)
+        m_elBufferingPeriod.assign(data + n.begin, data + n.end); // buffering period SEI
+      else if (type == 63 && inner < 32 && elType < 0)
+        elType = inner;
+      else if (type < 32 && blType < 0)
+        blType = type;
     }
-    CLog::LogF(LOGINFO, "dual layer: starting at pts {:.3f} after {} packets ({})",
-               pts.count() / 1e9, m_droppedForElIdr,
-               elType == 19 || elType == 20 ? "EL IDR" : "no EL IDR found");
-    m_waitForElIdr = false;
+    if (m_waitForElIdr)
+    {
+      if (elType != 19 && elType != 20 && ++m_droppedForElIdr < 400)
+      {
+        m_skippedVideoPts = pts;
+        return true;
+      }
+      CLog::LogF(LOGINFO, "dual layer: starting at pts {:.3f} after {} packets ({})",
+                 pts.count() / 1e9, m_droppedForElIdr,
+                 elType == 19 || elType == 20 ? "EL IDR" : "no EL IDR found");
+      m_waitForElIdr = false;
+    }
+    // the splitter restarts at any base-layer IRAP, a CRA included ("search first IDR")
+    if (m_waitForBlIrap && blType >= 16 && blType <= 23)
+    {
+      m_waitForBlIrap = false;
+      if ((!blSps && !m_blParamSets[1].empty()) || (!elSps && !m_elParamSets[1].empty()))
+      {
+        CLog::LogF(LOGINFO, "dual layer: first base-layer IRAP at pts {:.3f}, adding {}{}",
+                   pts.count() / 1e9, blSps ? "" : "base-layer ", elSps ? "" : "EL ");
+        // base-layer sets after its AUD, EL sets after the EL's AUD (or before its first NAL)
+        size_t blAt = 0;
+        size_t elAt = size;
+        for (const Nal& n : nals)
+        {
+          const int type = (data[n.nal] >> 1) & 0x3f;
+          if (type == 35 && blAt == 0)
+            blAt = n.end;
+          if (type == 63 && elAt == size)
+          {
+            const bool aud = n.end - n.nal > 2 && ((data[n.nal + 2] >> 1) & 0x3f) == 35;
+            elAt = aud ? n.end : n.begin;
+          }
+        }
+        m_dualLayerStart.clear();
+        m_dualLayerStart.insert(m_dualLayerStart.end(), data, data + blAt);
+        if (!blSps)
+          for (const auto& set : m_blParamSets)
+            m_dualLayerStart.insert(m_dualLayerStart.end(), set.begin(), set.end());
+        m_dualLayerStart.insert(m_dualLayerStart.end(), data + blAt, data + elAt);
+        if (!elSps)
+        {
+          for (const auto& set : m_elParamSets)
+            m_dualLayerStart.insert(m_dualLayerStart.end(), set.begin(), set.end());
+          // the splitter activates an SPS only from a buffering period SEI (its
+          // bp_seq_parameter_set_id), which the EL picture here, no IRAP, does not carry
+          m_dualLayerStart.insert(m_dualLayerStart.end(), m_elBufferingPeriod.begin(),
+                                  m_elBufferingPeriod.end());
+          m_zeroElCpbDelay = true;
+        }
+        m_dualLayerStart.insert(m_dualLayerStart.end(), data + elAt, data + size);
+        data = m_dualLayerStart.data();
+        size = m_dualLayerStart.size();
+      }
+    }
   }
 
   if (m_flushed)
@@ -1636,10 +1731,13 @@ bool CMediaPipelineWebOS::FeedVideoData(const std::shared_ptr<CDVDMsg>& msg)
       {
         if (data != m_dualLayerBuffer.data())
           m_dualLayerBuffer.assign(data, data + size);
-        ZeroElCraCpbRemovalDelay(m_dualLayerBuffer, {m_elCpbDelay->first, m_elCpbDelay->second});
+        // also where an EL buffering period was added (see the first base-layer IDR above)
+        ZeroElCraCpbRemovalDelay(m_dualLayerBuffer, {m_elCpbDelay->first, m_elCpbDelay->second},
+                                 m_zeroElCpbDelay);
         data = m_dualLayerBuffer.data();
         size = m_dualLayerBuffer.size();
       }
+      m_zeroElCpbDelay = false;
     }
     CVariant payload;
     payload["bufferAddr"] = fmt::format("{:#x}", reinterpret_cast<std::uintptr_t>(data));
