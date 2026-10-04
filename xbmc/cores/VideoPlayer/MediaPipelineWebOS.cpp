@@ -1223,6 +1223,7 @@ bool CMediaPipelineWebOS::FeedVideoData(const std::shared_ptr<CDVDMsg>& msg)
                            : std::chrono::steady_clock::time_point{};
 
     m_pts = pts;
+    m_startPts = pts;
     m_fedVideoPts = NO_PTS;
     m_fedAudioPts = NO_PTS;
     m_started = false;
@@ -1687,6 +1688,11 @@ void CMediaPipelineWebOS::PlayerCallback(int32_t type, const int64_t numValue, c
   {
     case PF_EVENT_TYPE_FRAMEREADY:
     {
+      // A frame from before a seek can be reported after the first packet behind the seek was
+      // fed. Taken as the start, it puts m_pts back at the old position and the feed-ahead limit
+      // stops feeding for good: the TV starves before its first frame (Avatar, ~1 seek in 2).
+      if (!m_started && std::chrono::nanoseconds(numValue) < m_startPts.load())
+        break;
       m_pts = std::chrono::nanoseconds(numValue);
       const double pts = GetCurrentPts();
       ProcessOverlays(pts);

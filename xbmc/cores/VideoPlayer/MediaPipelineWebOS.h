@@ -525,6 +525,7 @@ private:
 
   std::atomic<std::chrono::nanoseconds> m_fedAudioPts{NO_PTS};
   std::atomic<std::chrono::nanoseconds> m_fedVideoPts{NO_PTS};
+  std::atomic<std::chrono::nanoseconds> m_startPts{NO_PTS};
   std::atomic<bool> m_started{false};
   // When no frame has arrived by then after a start or seek, ask the pipeline to play again
   // (setting videoplayer.starfishresumetimeout). Default-constructed = not armed. Video thread.
