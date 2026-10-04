@@ -1264,6 +1264,7 @@ void CWinSystemWayland::Unregister(IDispResource* resource)
 
 void CWinSystemWayland::OnSeatAdded(std::uint32_t name, wayland::proxy_t&& proxy)
 {
+  CLog::Log(LOGINFO, "Wayland seat {} added", name);
   std::unique_lock lock(m_seatsMutex);
 
   wayland::seat_t seat(proxy);
@@ -1282,6 +1283,7 @@ std::unique_ptr<CSeat> CWinSystemWayland::CreateSeat(std::uint32_t name, wayland
 
 void CWinSystemWayland::OnSeatRemoved(std::uint32_t name)
 {
+  CLog::Log(LOGINFO, "Wayland seat {} removed", name);
   std::unique_lock lock(m_seatsMutex);
 
   auto seatI = m_seats.find(name);

@@ -84,6 +84,16 @@ public:
   {
     wayland::event_queue_t queueCopy{queue};
 
+    // A global added at runtime (e.g. a seat when a remote reconnects) is bound from inside
+    // dispatch on this thread, and CRegistry::Bind() roundtrips from there. Handing that to this
+    // thread and waiting would wait for ourselves forever: no more input events, ever. Nothing
+    // else dispatches here, and no read intent is held during dispatch, so roundtrip directly.
+    if (IsCurrentThread())
+    {
+      m_display.roundtrip_queue(queueCopy);
+      return;
+    }
+
     // Serialize invocations of this function - it's used very rarely and usually
     // not in parallel anyway, and doing it avoids lots of complications
     std::unique_lock lock(m_roundtripQueueMutex);
