@@ -667,6 +667,11 @@ int CBitstreamConverter::GetExtraSize() const
 void CBitstreamConverter::ResetStartDecode()
 {
   m_start_decode = false;
+  // A flushed decoder may have dropped the parameter sets. Prepend them to the next IDR again
+  // unless it carries its own: once a stream had in-band SPS/PPS (x265 writes them only at the
+  // start), idr_sps_pps_seen stayed set and they were never sent again.
+  m_sps_pps_context.first_idr = 1;
+  m_sps_pps_context.idr_sps_pps_seen = 0;
 }
 
 bool CBitstreamConverter::CanStartDecode() const
