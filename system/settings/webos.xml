@@ -32,6 +32,10 @@
             <formatlabel>14045</formatlabel>
           </control>
         </setting>
+        <!-- not every webOS TV decodes a profile 7 enhancement layer: convert to 8.1 by default -->
+        <setting id="videoplayer.convertdovi">
+          <default>true</default>
+        </setting>
       </group>
     </category>
   </section>
