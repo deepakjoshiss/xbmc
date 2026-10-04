@@ -647,6 +647,7 @@ bool CMediaPipelineWebOS::Load(CDVDStreamInfo videoHint, CDVDStreamInfo audioHin
     contents["DolbyHdrInfo"]["encryptionType"] = videoHint.cryptoSession ? "all" : "clear";
     contents["DolbyHdrInfo"]["profileId"] = videoHint.dovi.dv_profile;
     contents["DolbyHdrInfo"]["trackType"] = videoHint.dovi.el_present_flag ? "dual" : "single";
+    m_dualLayer = videoHint.dovi.el_present_flag;
   }
 
   using namespace KODI::WINDOWING::WAYLAND;
@@ -1256,6 +1257,37 @@ bool CMediaPipelineWebOS::FeedVideoData(const std::shared_ptr<CDVDMsg>& msg)
   if (data && size)
   {
     const auto feedPts = pts - std::chrono::milliseconds(m_renderManager.GetDelay());
+
+    // The TV's Dolby VES splitter finds the start of an enhancement-layer picture by the EL's own
+    // access unit delimiter (NAL 63 wrapping type 35). Without one it mistimes the EL, or divides
+    // by zero and takes Kodi down (LotR); add one before the first EL NAL unit when missing.
+    if (m_dualLayer)
+    {
+      size_t firstEl = size;
+      bool elAud = false;
+      for (size_t i = 0; i + 5 < size; ++i)
+      {
+        if (data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1 && data[i + 3] == 0x7e)
+        {
+          if (firstEl == size)
+            firstEl = (i > 0 && data[i - 1] == 0) ? i - 1 : i;
+          if (((data[i + 5] >> 1) & 0x3f) == 35)
+          {
+            elAud = true;
+            break;
+          }
+        }
+      }
+      if (firstEl < size && !elAud)
+      {
+        static constexpr uint8_t aud[] = {0, 0, 0, 1, 0x7e, 0x01, 0x46, 0x01, 0x50};
+        m_dualLayerBuffer.assign(data, data + firstEl);
+        m_dualLayerBuffer.insert(m_dualLayerBuffer.end(), std::begin(aud), std::end(aud));
+        m_dualLayerBuffer.insert(m_dualLayerBuffer.end(), data + firstEl, data + size);
+        data = m_dualLayerBuffer.data();
+        size = m_dualLayerBuffer.size();
+      }
+    }
     CVariant payload;
     payload["bufferAddr"] = fmt::format("{:#x}", reinterpret_cast<std::uintptr_t>(data));
     payload["bufferSize"] = size;

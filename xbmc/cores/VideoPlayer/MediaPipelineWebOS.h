@@ -24,6 +24,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include <starfish-media-pipeline/StarfishMediaAPIs.h>
 
@@ -499,6 +500,9 @@ private:
   std::atomic<bool> m_stalled{false};
   std::atomic<bool> m_loaded{false};
   std::atomic<bool> m_flushed{false};
+
+  bool m_dualLayer{false}; // Dolby Vision profile 7 fed with its enhancement layer
+  std::vector<uint8_t> m_dualLayerBuffer;
   std::atomic<bool> m_subtitle{false};
   std::atomic<double> m_subtitleDelay{0.0};
   std::atomic<bool> m_needsTranscode{false};
