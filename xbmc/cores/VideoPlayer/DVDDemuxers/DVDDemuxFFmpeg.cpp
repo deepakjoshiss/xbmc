@@ -1433,6 +1433,11 @@ bool CDVDDemuxFFmpeg::SeekTime(double time, bool backwards, double* startpts)
   else if (m_pFormatContext->start_time != (int64_t)AV_NOPTS_VALUE && !ismp3 && !m_bSup)
     seek_pts += m_pFormatContext->start_time;
 
+  // base-layer packets held for their enhancement layer are from before the seek (the wait for a
+  // transport stream above reads some too): released after it, VideoPlayer takes the first real
+  // packet for a forward jump and may strip its timestamps
+  ClearDoviHeld();
+
   int ret;
   {
     std::unique_lock lock(m_critSection);
