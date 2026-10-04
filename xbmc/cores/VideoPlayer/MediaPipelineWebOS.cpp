@@ -451,6 +451,9 @@ void CMediaPipelineWebOS::Flush(bool sync)
   FlushVideoMessages();
   if (m_bitstream)
     m_bitstream->ResetStartDecode();
+  m_waitForElIdr = true;
+  m_droppedForElIdr = 0;
+  m_skippedVideoPts = NO_PTS;
   m_fedAudioPts = NO_PTS;
   m_fedVideoPts = NO_PTS;
   m_started = false;
@@ -647,6 +650,9 @@ bool CMediaPipelineWebOS::Load(CDVDStreamInfo videoHint, CDVDStreamInfo audioHin
   CVariant& contents = p["option"]["externalStreamingInfo"]["contents"];
   m_dualLayer = false;
   m_elCpbDelay.reset();
+  m_waitForElIdr = true;
+  m_droppedForElIdr = 0;
+  m_skippedVideoPts = NO_PTS;
   if (videoHint.hdrType == StreamHdrType::HDR_TYPE_DOLBYVISION)
   {
     contents["DolbyHdrInfo"]["encryptionType"] = videoHint.cryptoSession ? "all" : "clear";
@@ -1412,7 +1418,15 @@ bool CMediaPipelineWebOS::FeedAudioData(const std::shared_ptr<CDVDMsg>& msg)
   // fed before it starts the TV's passthrough decoder against the stale position, and it stays
   // silent (files that store audio ahead of video, e.g. AC-3/E-AC-3 MP4s, after any seek).
   if (m_flushed)
+  {
+    // while dual-layer video waits for an EL IDR (FeedVideoData) audio piles up behind this gate
+    // and blocks the demuxer before the IDR is read: drop what is a second older than the video
+    // skipped so far, it lies before the picture start anyway
+    const std::chrono::nanoseconds skipped = m_skippedVideoPts.load();
+    if (m_waitForElIdr && skipped != NO_PTS && pts < skipped - 1s)
+      return true;
     return false;
+  }
 
   const std::chrono::nanoseconds fedAudioPts = m_fedAudioPts.load();
   if (m_started && fedAudioPts != NO_PTS && fedAudioPts - m_pts.load() > MAX_FEED_AHEAD_TIME)
@@ -1483,6 +1497,32 @@ bool CMediaPipelineWebOS::FeedVideoData(const std::shared_ptr<CDVDMsg>& msg)
 
     size = m_bitstream->GetConvertSize();
     data = m_bitstream->GetConvertBuffer();
+  }
+
+  // The TV's Dolby VES splitter sets up its enhancement-layer clock only at an EL IDR: started
+  // (load, seek) at a CRA it times the EL from a stale or zero base and no EL picture ever pairs.
+  // Start dual-layer feeding at the first access unit whose EL picture is an IDR.
+  if (m_dualLayer && m_waitForElIdr && data && size)
+  {
+    int elType = -1;
+    for (size_t i = 0; i + 5 < size; ++i)
+    {
+      if (data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1 && data[i + 3] == 0x7e &&
+          ((data[i + 5] >> 1) & 0x3f) < 32)
+      {
+        elType = (data[i + 5] >> 1) & 0x3f;
+        break;
+      }
+    }
+    if (elType != 19 && elType != 20 && ++m_droppedForElIdr < 400)
+    {
+      m_skippedVideoPts = pts;
+      return true;
+    }
+    CLog::LogF(LOGINFO, "dual layer: starting at pts {:.3f} after {} packets ({})",
+               pts.count() / 1e9, m_droppedForElIdr,
+               elType == 19 || elType == 20 ? "EL IDR" : "no EL IDR found");
+    m_waitForElIdr = false;
   }
 
   if (m_flushed)

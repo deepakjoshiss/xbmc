@@ -506,6 +506,9 @@ private:
 
   bool m_dualLayer{false}; // Dolby Vision profile 7 fed with its enhancement layer
   std::vector<uint8_t> m_dualLayerBuffer;
+  std::atomic<bool> m_waitForElIdr{true}; // dual layer: video waits for an EL IDR
+  std::atomic<std::chrono::nanoseconds> m_skippedVideoPts{NO_PTS};
+  unsigned int m_droppedForElIdr{0};
   // where au_cpb_removal_delay_minus1 sits in EL picture timing SEIs, from the EL SPS
   std::optional<std::pair<unsigned int, unsigned int>> m_elCpbDelay; // bit offset, length
   std::atomic<bool> m_subtitle{false};
