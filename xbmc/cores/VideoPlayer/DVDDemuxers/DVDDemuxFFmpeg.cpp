@@ -1496,6 +1496,9 @@ bool CDVDDemuxFFmpeg::SeekTime(double time, bool backwards, double* startpts)
         ret = 0;
     }
 
+    if (ret >= 0 && !beyondEof && m_idrSeekStream >= 0 && m_seekStream < 0)
+      SeekBackToIdr(seek_pts, backwards);
+
     if (ret >= 0)
     {
       if (!(m_pFormatContext->iformat->flags & AVFMT_NOTIMESTAMPS))
@@ -1692,6 +1695,7 @@ void CDVDDemuxFFmpeg::CreateStreams(unsigned int program)
 
   DisposeStreams();
   FindDoviDualTrack();
+  m_idrSeekStream = FindIdrSeekStream();
 
   // add the ffmpeg streams to our own stream map
   if (m_pFormatContext->nb_programs)
@@ -3043,6 +3047,95 @@ void CDVDDemuxFFmpeg::FindDoviDualTrack()
   CLog::LogF(LOGINFO, "dual-track Dolby Vision profile {}: {} of stream {} go to stream {}",
              m_doviConf.dv_profile, m_doviWithEl ? "enhancement layer and RPUs" : "RPUs", el,
              bl);
+}
+
+int CDVDDemuxFFmpeg::FindIdrSeekStream() const
+{
+#if defined(TARGET_WEBOS)
+  if (CServiceBroker::GetSettingsComponent()->GetSettings()->GetBool(
+          CSettings::SETTING_VIDEOPLAYER_CONVERTDOVI))
+    return -1;
+  // dual-track files (MP4, TS) seen put an IDR at every keyframe: the check only costs a seek
+  if (m_doviBlIndex >= 0)
+    return -1;
+  for (unsigned int i = 0; i < m_pFormatContext->nb_streams; i++)
+  {
+    const AVCodecParameters* par = m_pFormatContext->streams[i]->codecpar;
+    if (par->codec_id != AV_CODEC_ID_HEVC)
+      continue;
+    const AVPacketSideData* sd = av_packet_side_data_get(
+        par->coded_side_data, par->nb_coded_side_data, AV_PKT_DATA_DOVI_CONF);
+    if (sd && sd->size >= static_cast<int>(sizeof(AVDOVIDecoderConfigurationRecord)))
+    {
+      const auto* conf = reinterpret_cast<const AVDOVIDecoderConfigurationRecord*>(sd->data);
+      if (conf->dv_profile == 7 && conf->bl_present_flag && conf->el_present_flag)
+        return static_cast<int>(i);
+    }
+  }
+#endif
+  return -1;
+}
+
+void CDVDDemuxFFmpeg::SeekBackToIdr(int64_t seekPts, bool backwards)
+{
+  // webOS's dual-layer Dolby Vision pipeline times the enhancement layer only from an IDR, so
+  // after a seek MediaPipelineWebOS feeds video from the first one. A seek lands on the keyframe
+  // before the target, mostly a CRA: Blu-ray profile 7 has IDRs only at scene cuts, 1-15 s apart,
+  // and the picture stayed frozen until the demuxer had read up to the next (14 s on Aquaman over
+  // Wi-Fi). Step back keyframe by keyframe to the IDR at or before the target instead, as for
+  // any seek; more than 10 s back, keep the keyframe the seek found.
+  AVStream* st = m_pFormatContext->streams[m_idrSeekStream];
+  const int lengthSize = HvccLengthSize(st->codecpar);
+  const int64_t limit = av_rescale_q(seekPts - 10 * AV_TIME_BASE, AV_TIME_BASE_Q, st->time_base);
+  AVPacket* pkt = av_packet_alloc();
+  if (!pkt)
+    return;
+
+  for (int step = 0; step < 32; step++)
+  {
+    int64_t pts = AV_NOPTS_VALUE;
+    int64_t dts = AV_NOPTS_VALUE;
+    bool idr = false;
+    for (int n = 0; n < 1000 && pts == AV_NOPTS_VALUE && av_read_frame(m_pFormatContext, pkt) >= 0;
+         n++)
+    {
+      if (pkt->stream_index == m_idrSeekStream)
+      {
+        pts = pkt->pts;
+        dts = pkt->dts != AV_NOPTS_VALUE ? pkt->dts : pkt->pts;
+        for (const auto& [nal, size] : SplitNals(pkt->data, pkt->size, lengthSize))
+        {
+          const int type = (nal[0] >> 1) & 0x3f;
+          if (type < 32) // the first base-layer slice
+          {
+            idr = type == 19 || type == 20;
+            break;
+          }
+        }
+      }
+      av_packet_unref(pkt);
+    }
+    if (pts == AV_NOPTS_VALUE)
+      break;
+    if (idr && step > 0)
+    {
+      // its pts is at or past its dts, but before the next keyframe's dts: lands on it
+      av_seek_frame(m_pFormatContext, m_idrSeekStream, pts, AVSEEK_FLAG_BACKWARD);
+      av_packet_free(&pkt);
+      CLog::LogF(LOGINFO, "dual-layer Dolby Vision: seek moved back {} keyframes to the IDR at {:.3f}",
+                 step, pts * av_q2d(st->time_base));
+      return;
+    }
+    if (idr)
+      break;
+    const int64_t before = std::min(pts, dts) - 1;
+    if (before < limit || av_seek_frame(m_pFormatContext, m_idrSeekStream, before,
+                                        AVSEEK_FLAG_BACKWARD) < 0)
+      break;
+  }
+  av_packet_free(&pkt);
+  // the keyframe the seek found was an IDR, or none was close enough: back to it
+  av_seek_frame(m_pFormatContext, m_seekStream, seekPts, backwards ? AVSEEK_FLAG_BACKWARD : 0);
 }
 
 void CDVDDemuxFFmpeg::StoreDoviRpu(const AVPacket& pkt, const AVStream* stream)

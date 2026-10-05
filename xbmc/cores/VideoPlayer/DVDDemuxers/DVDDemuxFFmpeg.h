@@ -156,6 +156,9 @@ protected:
   void StoreDoviRpu(const AVPacket& pkt, const AVStream* stream);
   void AttachDoviRpu(DemuxPacket* pkt);
   void ClearDoviHeld();
+  // dual-layer Dolby Vision on webOS starts at an IDR: SeekTime steps back to one
+  int FindIdrSeekStream() const;
+  void SeekBackToIdr(int64_t seekPts, bool backwards);
 
   CCriticalSection m_critSection;
   std::map<int, CDemuxStream*> m_streams;
@@ -216,6 +219,7 @@ protected:
   std::map<double, std::vector<uint8_t>> m_doviRpus; // dts -> EL NAL units to append, prefixed
   double m_doviElDts = DVD_NOPTS_VALUE; // last enhancement-layer dts read
   bool m_doviElRead = false; // ReadInternal consumed an enhancement-layer packet
+  int m_idrSeekStream = -1; // video stream SeekTime moves back to an IDR on, -1 for none
   std::deque<DemuxPacket*> m_doviHeld; // base-layer packets waiting for their RPU
   double m_startTime = 0;
   std::vector<ChapterFFmpeg> m_chapters;
