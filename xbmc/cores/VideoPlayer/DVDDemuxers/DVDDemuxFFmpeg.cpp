@@ -37,6 +37,7 @@
 #include "utils/log.h"
 
 #include <algorithm>
+#include <array>
 #include <cstring>
 #include <map>
 #include <memory>
@@ -3134,10 +3135,12 @@ int CDVDDemuxFFmpeg::FindIdrSeekStream() const
   if (CServiceBroker::GetSettingsComponent()->GetSettings()->GetBool(
           CSettings::SETTING_VIDEOPLAYER_CONVERTDOVI))
     return -1;
-  // dual-track files (MP4, TS) seen put an IDR at every keyframe: the check only costs a seek; a
-  // MEL is played as 8.1, single layer
-  if (m_doviBlIndex >= 0 || m_doviMel)
+  // a MEL is played as 8.1, single layer; a dual-track file's base layer is where its IDRs are
+  // (John Wick 3: CRAs every 0.9 s, IDRs at scene cuts, as in Blu-ray single-track files)
+  if (m_doviMel)
     return -1;
+  if (m_doviBlIndex >= 0)
+    return m_doviBlIndex;
   for (unsigned int i = 0; i < m_pFormatContext->nb_streams; i++)
   {
     const AVCodecParameters* par = m_pFormatContext->streams[i]->codecpar;
@@ -3167,6 +3170,58 @@ void CDVDDemuxFFmpeg::SeekBackToIdr(int64_t seekPts, bool backwards)
   AVStream* st = m_pFormatContext->streams[m_idrSeekStream];
   const int lengthSize = HvccLengthSize(st->codecpar);
   const int64_t limit = av_rescale_q(seekPts - 10 * AV_TIME_BASE, AV_TIME_BASE_Q, st->time_base);
+
+  // A dual-track file (MP4) indexes every sample's position: read each keyframe's first bytes
+  // straight from the file. Demuxing instead reads the other tracks' interleaved chunks, and
+  // Gladiator paid 2-4 s of cache reconnects per seek for an IDR it already had. A dual-PID
+  // MPEG-TS has no length-prefixed samples to read this way: keep the seek as it stands.
+  if (m_doviBlIndex >= 0)
+  {
+    if (lengthSize <= 0)
+      return;
+    const int64_t target = av_rescale_q(seekPts, AV_TIME_BASE_Q, st->time_base);
+    std::array<uint8_t, 4096> buf;
+    int steps = 0;
+    for (int k = av_index_search_timestamp(st, target, AVSEEK_FLAG_BACKWARD); k >= 0 && steps < 32;
+         k--)
+    {
+      const AVIndexEntry* e = avformat_index_get_entry(st, k);
+      if (!e || !(e->flags & AVINDEX_KEYFRAME))
+        continue;
+      if (e->timestamp < limit || avio_seek(m_pFormatContext->pb, e->pos, SEEK_SET) < 0)
+        break;
+      const int got = avio_read(m_pFormatContext->pb, buf.data(),
+                                std::min(static_cast<int>(buf.size()), e->size));
+      // the first base-layer slice's type; only its header byte has to be in the buffer
+      int type = -1;
+      for (int i = 0; type < 0 && i + lengthSize < got;)
+      {
+        size_t len = 0;
+        for (int j = 0; j < lengthSize; j++)
+          len = (len << 8) | buf[i + j];
+        const int t = (buf[i + lengthSize] >> 1) & 0x3f;
+        if (t < 32)
+          type = t;
+        i += lengthSize + static_cast<int>(len);
+      }
+      if (type < 0)
+        break;
+      if (type == 19 || type == 20)
+      {
+        if (steps == 0)
+          break; // the keyframe the seek found: back to it below
+        av_seek_frame(m_pFormatContext, m_idrSeekStream, e->timestamp, AVSEEK_FLAG_BACKWARD);
+        CLog::LogF(LOGINFO,
+                   "dual-layer Dolby Vision: seek moved back {} keyframes to the IDR at {:.3f}",
+                   steps, e->timestamp * av_q2d(st->time_base));
+        return;
+      }
+      steps++;
+    }
+    av_seek_frame(m_pFormatContext, m_seekStream, seekPts, backwards ? AVSEEK_FLAG_BACKWARD : 0);
+    return;
+  }
+
   AVPacket* pkt = av_packet_alloc();
   if (!pkt)
     return;
