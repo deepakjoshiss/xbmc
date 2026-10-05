@@ -80,6 +80,7 @@ public:
   std::shared_ptr<AVContentLightMetadata> contentLightMetadata;
   std::string stereo_mode; // stereoscopic 3d mode
   AVDOVIDecoderConfigurationRecord dovi{};
+  bool doviMel{false}; // profile 7 with a MEL: nothing is lost by dropping the EL
 
   // AUDIO
   int channels;

@@ -158,6 +158,8 @@ protected:
   void ClearDoviHeld();
   // dual-layer Dolby Vision on webOS starts at an IDR: SeekTime steps back to one
   int FindIdrSeekStream() const;
+  // whether a profile 7 enhancement layer is a MEL, from the first RPU (libdovi's el_type)
+  bool DetectDoviMel();
   void SeekBackToIdr(int64_t seekPts, bool backwards);
 
   CCriticalSection m_critSection;
@@ -220,6 +222,7 @@ protected:
   double m_doviElDts = DVD_NOPTS_VALUE; // last enhancement-layer dts read
   bool m_doviElRead = false; // ReadInternal consumed an enhancement-layer packet
   int m_idrSeekStream = -1; // video stream SeekTime moves back to an IDR on, -1 for none
+  bool m_doviMel = false; // profile 7 with a MEL: played as 8.1 even without compatibility mode
   std::deque<DemuxPacket*> m_doviHeld; // base-layer packets waiting for their RPU
   double m_startTime = 0;
   std::vector<ChapterFFmpeg> m_chapters;

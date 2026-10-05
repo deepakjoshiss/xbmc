@@ -832,6 +832,8 @@ bool CMediaPipelineWebOS::Load(CDVDStreamInfo videoHint, CDVDStreamInfo audioHin
   std::string formatName = fmt::format(
       "starfish-{}{}", videoHint.hdrType == StreamHdrType::HDR_TYPE_DOLBYVISION ? "d" : "",
       StringUtils::ToLower(ms_codecMap.at(videoHint.codec)));
+  if (!m_doviPlayback.empty())
+    formatName += fmt::format(" ({})", m_doviPlayback);
   m_processInfo.SetVideoDecoderName(formatName, true);
   m_processInfo.SetVideoPixelFormat("Surface");
   m_processInfo.SetVideoDimensions(videoHint.width, videoHint.height);
@@ -1274,6 +1276,7 @@ bool ZeroElCraCpbRemovalDelay(std::vector<uint8_t>& au,
 
 void CMediaPipelineWebOS::SetupBitstreamConverter(CDVDStreamInfo& hint)
 {
+  const int sourceProfile = hint.dovi.dv_profile;
   const std::shared_ptr<CSettings> settings = CServiceBroker::GetSettingsComponent()->GetSettings();
   // profile 7 with an enhancement layer is fed as it is (trackType "dual") unless the user asked
   // for the profile 8.1 conversion
@@ -1303,8 +1306,11 @@ void CMediaPipelineWebOS::SetupBitstreamConverter(CDVDStreamInfo& hint)
           m_bitstream->SetRemoveHdr10Plus(true);
 
           // Only set for profile 7, container hint allows to skip parsing unnecessarily
-          // set profile 8 and single layer when converting
-          if (!removeDovi && convertDovi && hint.dovi.dv_profile == 7)
+          // set profile 8 and single layer when converting. A MEL's enhancement layer adds no
+          // picture data, so it is converted whatever the setting: the TV's dual-layer pipeline
+          // mistimes an EL whose IDRs are not on the base layer's (The Last Jedi: frozen ~10 s
+          // after every seek), and 8.1 looks the same.
+          if (!removeDovi && (convertDovi || hint.doviMel) && hint.dovi.dv_profile == 7)
           {
             m_bitstream->SetConvertDovi(true);
             hint.dovi.dv_profile = 8;
@@ -1334,6 +1340,18 @@ void CMediaPipelineWebOS::SetupBitstreamConverter(CDVDStreamInfo& hint)
       }
     }
   }
+
+  // how Dolby Vision is played, for the player process info ("Video decoder")
+  if (hint.hdrType != StreamHdrType::HDR_TYPE_DOLBYVISION)
+    m_doviPlayback.clear();
+  else if (sourceProfile == 7 && hint.dovi.dv_profile == 8)
+    m_doviPlayback = hint.doviMel ? "DV 7 MEL -> 8.1" : "DV 7 -> 8.1";
+  else if (sourceProfile == 7 && hint.dovi.el_present_flag)
+    m_doviPlayback = "DV 7 FEL, dual layer";
+  else if (hint.dovi.dv_profile == 8)
+    m_doviPlayback = fmt::format("DV 8.{}", hint.dovi.dv_bl_signal_compatibility_id);
+  else
+    m_doviPlayback = fmt::format("DV {}", hint.dovi.dv_profile);
 }
 
 void CMediaPipelineWebOS::SetHDR(const CDVDStreamInfo& hint) const

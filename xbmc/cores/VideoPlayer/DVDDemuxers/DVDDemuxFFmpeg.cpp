@@ -58,6 +58,10 @@ extern "C"
 #include <libavutil/dovi_meta.h>
 #include <libavutil/opt.h>
 #include <libavutil/pixdesc.h>
+
+#ifdef HAVE_LIBDOVI
+#include <libdovi/rpu_parser.h>
+#endif
 }
 
 using namespace KODI::UTILS;
@@ -645,6 +649,9 @@ bool CDVDDemuxFFmpeg::Open(const std::shared_ptr<CDVDInputStream>& pInput, bool 
   // The transport stream re-open below skips avformat_find_stream_info(), so put back what the
   // first probe established before the streams are built from it.
   RestoreProbedStreamParameters();
+
+  if (!skipCreateStreams)
+    m_doviMel = DetectDoviMel();
 
   // in case of mpegts and we have not seen pat/pmt, defer creation of streams
   if (!skipCreateStreams || m_pFormatContext->nb_programs > 0)
@@ -2046,6 +2053,7 @@ CDemuxStream* CDVDDemuxFFmpeg::AddStream(int streamIdx)
         {
           st->hdr_type = StreamHdrType::HDR_TYPE_DOLBYVISION;
           st->dovi = m_doviConf;
+          st->doviMel = m_doviMel;
         }
 
         // https://github.com/FFmpeg/FFmpeg/blob/release/7.0/doc/APIchanges
@@ -2060,6 +2068,7 @@ CDemuxStream* CDVDDemuxFFmpeg::AddStream(int streamIdx)
           if (sideData && sideData->size)
           {
             st->dovi = *reinterpret_cast<const AVDOVIDecoderConfigurationRecord*>(sideData->data);
+            st->doviMel = m_doviMel && st->dovi.dv_profile == 7;
           }
         }
 
@@ -3039,8 +3048,8 @@ void CDVDDemuxFFmpeg::FindDoviDualTrack()
 
   m_doviBlIndex = bl;
   m_doviElIndex = el;
-  m_doviWithEl = !CServiceBroker::GetSettingsComponent()->GetSettings()->GetBool(
-      CSettings::SETTING_VIDEOPLAYER_CONVERTDOVI);
+  m_doviWithEl = !m_doviMel && !CServiceBroker::GetSettingsComponent()->GetSettings()->GetBool(
+                                    CSettings::SETTING_VIDEOPLAYER_CONVERTDOVI);
   m_doviConf.bl_present_flag = 1;
   m_doviLengthSize = HvccLengthSize(m_pFormatContext->streams[bl]->codecpar);
   m_doviElLengthSize = HvccLengthSize(m_pFormatContext->streams[el]->codecpar);
@@ -3049,14 +3058,85 @@ void CDVDDemuxFFmpeg::FindDoviDualTrack()
              bl);
 }
 
+bool CDVDDemuxFFmpeg::DetectDoviMel()
+{
+#if defined(TARGET_WEBOS) && defined(HAVE_LIBDOVI)
+  // Only where profile 7 would otherwise go dual layer, i.e. without "Dolby Vision compatibility
+  // mode", and only on an input that can go back to where it was.
+  if (CServiceBroker::GetSettingsComponent()->GetSettings()->GetBool(
+          CSettings::SETTING_VIDEOPLAYER_CONVERTDOVI) ||
+      m_pInput->Seek(0, DVDSTREAM_SEEK_POSSIBLE) == 0)
+    return false;
+
+  // the stream with the RPUs: the EL track of a dual-track file, else the single-track P7 stream
+  int idx = -1;
+  for (unsigned int i = 0; i < m_pFormatContext->nb_streams && idx < 0; i++)
+  {
+    const AVCodecParameters* par = m_pFormatContext->streams[i]->codecpar;
+    const AVPacketSideData* sd = par->codec_id == AV_CODEC_ID_HEVC
+                                     ? av_packet_side_data_get(par->coded_side_data,
+                                                               par->nb_coded_side_data,
+                                                               AV_PKT_DATA_DOVI_CONF)
+                                     : nullptr;
+    if (sd && sd->size >= static_cast<int>(sizeof(AVDOVIDecoderConfigurationRecord)))
+    {
+      const auto* conf = reinterpret_cast<const AVDOVIDecoderConfigurationRecord*>(sd->data);
+      if (conf->dv_profile == 7 && conf->rpu_present_flag)
+        idx = static_cast<int>(i);
+    }
+  }
+  if (idx < 0)
+    return false;
+
+  // The first packets after avformat_find_stream_info() come from its buffer; the seek below puts
+  // the demuxer back at the start.
+  const int lengthSize = HvccLengthSize(m_pFormatContext->streams[idx]->codecpar);
+  bool found = false;
+  bool mel = false;
+  AVPacket* pkt = av_packet_alloc();
+  for (int n = 0; pkt && n < 200 && !found && av_read_frame(m_pFormatContext, pkt) >= 0; n++)
+  {
+    if (pkt->stream_index == idx)
+    {
+      for (const auto& [nal, size] : SplitNals(pkt->data, pkt->size, lengthSize))
+      {
+        if (((nal[0] >> 1) & 0x3f) != 62)
+          continue;
+        DoviRpuOpaque* rpu = dovi_parse_unspec62_nalu(nal, size);
+        if (const DoviRpuDataHeader* header = dovi_rpu_get_header(rpu))
+        {
+          found = header->el_type != nullptr;
+          mel = found && std::string(header->el_type) == "MEL";
+          dovi_rpu_free_header(header);
+        }
+        dovi_rpu_free(rpu);
+        break;
+      }
+    }
+    av_packet_unref(pkt);
+  }
+  av_packet_free(&pkt);
+  const int64_t start =
+      m_pFormatContext->start_time != AV_NOPTS_VALUE ? m_pFormatContext->start_time : 0;
+  av_seek_frame(m_pFormatContext, -1, start, AVSEEK_FLAG_BACKWARD);
+
+  CLog::LogF(LOGINFO, "Dolby Vision profile 7 enhancement layer: {}",
+             !found ? "unknown" : mel ? "MEL, played as profile 8.1" : "FEL");
+  return mel;
+#else
+  return false;
+#endif
+}
+
 int CDVDDemuxFFmpeg::FindIdrSeekStream() const
 {
 #if defined(TARGET_WEBOS)
   if (CServiceBroker::GetSettingsComponent()->GetSettings()->GetBool(
           CSettings::SETTING_VIDEOPLAYER_CONVERTDOVI))
     return -1;
-  // dual-track files (MP4, TS) seen put an IDR at every keyframe: the check only costs a seek
-  if (m_doviBlIndex >= 0)
+  // dual-track files (MP4, TS) seen put an IDR at every keyframe: the check only costs a seek; a
+  // MEL is played as 8.1, single layer
+  if (m_doviBlIndex >= 0 || m_doviMel)
     return -1;
   for (unsigned int i = 0; i < m_pFormatContext->nb_streams; i++)
   {

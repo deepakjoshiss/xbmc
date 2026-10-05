@@ -179,6 +179,7 @@ public:
   std::string stereo_mode; // expected stereo mode
   StreamHdrType hdr_type = StreamHdrType::HDR_TYPE_NONE; // type of HDR for this stream (hdr10, etc)
   AVDOVIDecoderConfigurationRecord dovi{};
+  bool doviMel = false; // profile 7 whose enhancement layer is a MEL (adds no picture data)
 };
 
 class CDemuxStreamAudio : public CDemuxStream

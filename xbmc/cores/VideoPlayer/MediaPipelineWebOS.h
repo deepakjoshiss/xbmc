@@ -515,6 +515,7 @@ private:
   std::array<std::vector<uint8_t>, 3> m_elParamSets; // the same for the EL, wrapped in NAL 63
   std::vector<uint8_t> m_elBufferingPeriod; // EL buffering period SEI, wrapped
   bool m_zeroElCpbDelay{false};
+  std::string m_doviPlayback; // e.g. "DV 7 MEL -> 8.1", appended to the video decoder name
   std::vector<uint8_t> m_dualLayerStart;
   // where au_cpb_removal_delay_minus1 sits in EL picture timing SEIs, from the EL SPS
   std::optional<std::pair<unsigned int, unsigned int>> m_elCpbDelay; // bit offset, length
