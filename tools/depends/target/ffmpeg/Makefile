@@ -5,7 +5,8 @@ DEPS = FFMPEG-VERSION Makefile ../../download-files.include \
                       001-ffmpeg-all-libpostproc-plugin.patch \
                       002-ffmpeg-libavutil-common-h-cpp11-constant-macros.patch \
                       008-ffmpeg-all-pgssubdec-use-caller-colorspace.patch \
-                      009-ffmpeg-all-seek-rescale-index-once.patch
+                      009-ffmpeg-all-seek-rescale-index-once.patch \
+                      010-ffmpeg-all-seek-skip-buffer-tuning-custom-io.patch
 
 BUILD_TYPE = Release
 ifeq ($(DEBUG_BUILD),yes)
@@ -48,7 +49,7 @@ all: .installed-$(PLATFORM)
 	rm -rf $(PLATFORM); mkdir -p $(PLATFORM)/build
 	cd $(PLATFORM); $(ARCHIVE_TOOL) $(ARCHIVE_TOOL_FLAGS) $(TARBALLS_LOCATION)/$(ARCHIVE)
 	cd $(PLATFORM); cp ../CMakeLists.txt ./
-	cd $(PLATFORM); cp ../001-ffmpeg-all-libpostproc-plugin.patch ../002-ffmpeg-libavutil-common-h-cpp11-constant-macros.patch ../008-ffmpeg-all-pgssubdec-use-caller-colorspace.patch ../009-ffmpeg-all-seek-rescale-index-once.patch ./
+	cd $(PLATFORM); cp ../001-ffmpeg-all-libpostproc-plugin.patch ../002-ffmpeg-libavutil-common-h-cpp11-constant-macros.patch ../008-ffmpeg-all-pgssubdec-use-caller-colorspace.patch ../009-ffmpeg-all-seek-rescale-index-once.patch ../010-ffmpeg-all-seek-skip-buffer-tuning-custom-io.patch ./
 	cd $(PLATFORM)/build; $(CMAKE) $(CMAKE_ARGS) ..
 	touch $@
 

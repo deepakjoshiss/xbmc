@@ -205,6 +205,9 @@ macro(buildFFMPEG)
                       COMMAND ${CMAKE_COMMAND} -E copy
                       ${CMAKE_SOURCE_DIR}/tools/depends/target/ffmpeg/009-ffmpeg-all-seek-rescale-index-once.patch
                       <SOURCE_DIR>
+                      COMMAND ${CMAKE_COMMAND} -E copy
+                      ${CMAKE_SOURCE_DIR}/tools/depends/target/ffmpeg/010-ffmpeg-all-seek-skip-buffer-tuning-custom-io.patch
+                      <SOURCE_DIR>
     )
 
     if(NOT DISABLE_FFMPEG_SOURCE_PLUGINS)

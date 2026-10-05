@@ -1,0 +1,16 @@
+diff --git a/libavformat/seek.c b/libavformat/seek.c
+--- a/libavformat/seek.c
++++ b/libavformat/seek.c
+@@ -192,6 +192,12 @@
+     }
+ 
+     if (proto && !(strcmp(proto, "file") && strcmp(proto, "pipe") && strcmp(proto, "cache")))
++        return;
++
++    /* The caller supplied the I/O context (AVFMT_FLAG_CUSTOM_IO) and so does its own
++     * buffering, as the "cache" protocol does. The pair loops below take seconds on a
++     * long file with many tracks, to tune buffering that is not ffmpeg's here. */
++    if (s->flags & AVFMT_FLAG_CUSTOM_IO)
+         return;
+ 
+     /* Rescale each index timestamp once, not once per stream pair: the pair

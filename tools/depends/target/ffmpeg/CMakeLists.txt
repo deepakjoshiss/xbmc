@@ -161,6 +161,7 @@ else()
 endif()
 list(APPEND sourceplugin_patch COMMAND patch -p1 -i <SOURCE_DIR>/008-ffmpeg-all-pgssubdec-use-caller-colorspace.patch)
 list(APPEND sourceplugin_patch COMMAND patch -p1 -i <SOURCE_DIR>/009-ffmpeg-all-seek-rescale-index-once.patch)
+list(APPEND sourceplugin_patch COMMAND patch -p1 -i <SOURCE_DIR>/010-ffmpeg-all-seek-skip-buffer-tuning-custom-io.patch)
 
 include(ExternalProject)
 externalproject_add(ffmpeg
