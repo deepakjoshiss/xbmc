@@ -1005,6 +1005,8 @@ struct PicTimingCpbDelay
 {
   unsigned int offset{0};
   unsigned int length{0};
+  bool subPicHrd{false}; // sub_pic_hrd_params_present_flag: no irap_cpb_params_present_flag
+  unsigned int dpbOutputDelayLength{0}; // dpb_output_delay_length_minus1 + 1
 };
 
 std::vector<std::byte> Unescape(const uint8_t* p, size_t size)
@@ -1202,7 +1204,8 @@ std::optional<PicTimingCpbDelay> ParseSpsPicTimingCpbDelay(const uint8_t* sps, s
       br.SkipBits(4); // cpb_size_du_scale
     br.SkipBits(5); // initial_cpb_removal_delay_length_minus1
     const unsigned int length = br.ReadBits(5) + 1; // au_cpb_removal_delay_length_minus1
-    return PicTimingCpbDelay{frameFieldInfo ? 7u : 0u, length};
+    const unsigned int dpbLength = br.ReadBits(5) + 1; // dpb_output_delay_length_minus1
+    return PicTimingCpbDelay{frameFieldInfo ? 7u : 0u, length, subPicHrd, dpbLength};
   }
   catch (const std::out_of_range&)
   {
@@ -1214,6 +1217,10 @@ std::optional<PicTimingCpbDelay> ParseSpsPicTimingCpbDelay(const uint8_t* sps, s
 // au_cpb_removal_delay_minus1 to its EL clock on top of the POC it already counts, so the EL runs
 // ahead of the base layer until the next IDR and none of its pictures pair. Zero that field in
 // the EL CRA's picture timing SEI. Returns whether the access unit was changed.
+// That is right only where the CRA's buffering period says concatenation_flag 1, i.e. its own
+// au_cpb_removal_delay is not to be used (LotR, Gladiator). With concatenation_flag 0 the delay is
+// the CRA's timing and the splitter needs it: zeroed, the EL fell 18 frames behind at every CRA
+// (Black Panther, delay 17).
 bool ZeroElCraCpbRemovalDelay(std::vector<uint8_t>& au,
                               const PicTimingCpbDelay& field,
                               bool anyPicture = false)
@@ -1258,6 +1265,26 @@ bool ZeroElCraCpbRemovalDelay(std::vector<uint8_t>& au,
       payloadSize += std::to_integer<uint8_t>(rbsp[pos++]);
       if (pos + payloadSize > rbsp.size())
         break;
+      if (type == 0 && !anyPicture && payloadSize > 0) // buffering_period() (D.2.2)
+      {
+        try
+        {
+          BitReader br(std::span<const std::byte>(rbsp.data() + pos, payloadSize));
+          br.SkipUE(); // bp_seq_parameter_set_id
+          const bool irapCpbParams = !field.subPicHrd && br.ReadBits(1);
+          // cpb_delay_offset, dpb_delay_offset: without the DPB length, keep zeroing
+          if (!irapCpbParams || field.dpbOutputDelayLength)
+          {
+            if (irapCpbParams)
+              br.SkipBits(field.length + field.dpbOutputDelayLength);
+            if (!br.ReadBits(1)) // concatenation_flag
+              return false;
+          }
+        }
+        catch (const std::out_of_range&)
+        {
+        }
+      }
       if (type == 1 && (field.offset + field.length + 7) / 8 <= payloadSize)
       {
         for (unsigned int bit = field.offset; bit < field.offset + field.length; bit++)
@@ -1736,7 +1763,11 @@ bool CMediaPipelineWebOS::FeedVideoData(const std::shared_ptr<CDVDMsg>& msg)
           const auto parsed = ParseSpsPicTimingCpbDelay(data + i + 5, e - (i + 5));
           std::optional<std::pair<unsigned int, unsigned int>> field;
           if (parsed)
+          {
             field = std::make_pair(parsed->offset, parsed->length);
+            m_elSubPicHrd = parsed->subPicHrd;
+            m_elDpbOutputDelayLength = parsed->dpbOutputDelayLength;
+          }
           if (field != m_elCpbDelay)
             CLog::LogF(LOGINFO, "enhancement layer: au_cpb_removal_delay_minus1 {}",
                        field ? fmt::format("at bit {}, {} bits", field->first, field->second)
@@ -1750,7 +1781,9 @@ bool CMediaPipelineWebOS::FeedVideoData(const std::shared_ptr<CDVDMsg>& msg)
         if (data != m_dualLayerBuffer.data())
           m_dualLayerBuffer.assign(data, data + size);
         // also where an EL buffering period was added (see the first base-layer IDR above)
-        ZeroElCraCpbRemovalDelay(m_dualLayerBuffer, {m_elCpbDelay->first, m_elCpbDelay->second},
+        ZeroElCraCpbRemovalDelay(m_dualLayerBuffer,
+                                 {m_elCpbDelay->first, m_elCpbDelay->second, m_elSubPicHrd,
+                                  m_elDpbOutputDelayLength},
                                  m_zeroElCpbDelay);
         data = m_dualLayerBuffer.data();
         size = m_dualLayerBuffer.size();

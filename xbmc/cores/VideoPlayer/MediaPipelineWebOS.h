@@ -519,6 +519,8 @@ private:
   std::vector<uint8_t> m_dualLayerStart;
   // where au_cpb_removal_delay_minus1 sits in EL picture timing SEIs, from the EL SPS
   std::optional<std::pair<unsigned int, unsigned int>> m_elCpbDelay; // bit offset, length
+  bool m_elSubPicHrd{false}; // from the EL SPS too, for reading its buffering periods
+  unsigned int m_elDpbOutputDelayLength{0};
   std::atomic<bool> m_subtitle{false};
   std::atomic<double> m_subtitleDelay{0.0};
   std::atomic<bool> m_needsTranscode{false};
