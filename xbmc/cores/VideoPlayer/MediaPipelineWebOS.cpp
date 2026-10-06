@@ -47,6 +47,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <exception>
 #include <map>
 #include <optional>
@@ -1213,6 +1214,32 @@ std::optional<PicTimingCpbDelay> ParseSpsPicTimingCpbDelay(const uint8_t* sps, s
   }
 }
 
+// The first Annex B start code (00 00 01) at or after `from`, or size. memchr hops between the zero
+// bytes, which slice data has few of, where a byte loop tests every byte of every access unit.
+size_t NextStartCode(const uint8_t* p, size_t from, size_t size)
+{
+  while (from + 3 <= size)
+  {
+    const auto* zero = static_cast<const uint8_t*>(std::memchr(p + from, 0, size - 2 - from));
+    if (!zero)
+      break;
+    const size_t i = zero - p;
+    if (p[i + 1] == 0 && p[i + 2] == 1)
+      return i;
+    from = i + 1;
+  }
+  return size;
+}
+
+// whether the access unit has an enhancement-layer CRA (NAL 63 wrapping type 21)
+bool HasElCra(const uint8_t* au, size_t size)
+{
+  for (size_t i = NextStartCode(au, 0, size); i < size; i = NextStartCode(au, i + 1, size))
+    if (i + 5 < size && au[i + 3] == 0x7e && ((au[i + 5] >> 1) & 0x3f) == 21)
+      return true;
+  return false;
+}
+
 // At an enhancement-layer CRA the TV's Dolby VES splitter adds the picture timing SEI's
 // au_cpb_removal_delay_minus1 to its EL clock on top of the POC it already counts, so the EL runs
 // ahead of the base layer until the next IDR and none of its pictures pair. Zero that field in
@@ -1225,16 +1252,12 @@ bool ZeroElCraCpbRemovalDelay(std::vector<uint8_t>& au,
                               const PicTimingCpbDelay& field,
                               bool anyPicture = false)
 {
-  std::vector<size_t> starts;
-  for (size_t i = 0; i + 3 <= au.size(); ++i)
-    if (au[i] == 0 && au[i + 1] == 0 && au[i + 2] == 1)
-      starts.push_back(i + 3);
-  bool cra = false;
-  for (size_t s : starts)
-    if (s + 2 < au.size() && au[s] == 0x7e && ((au[s + 2] >> 1) & 0x3f) == 21)
-      cra = true;
-  if (!cra && !anyPicture)
+  if (!anyPicture && !HasElCra(au.data(), au.size()))
     return false;
+  std::vector<size_t> starts;
+  for (size_t i = NextStartCode(au.data(), 0, au.size()); i < au.size();
+       i = NextStartCode(au.data(), i + 1, au.size()))
+    starts.push_back(i + 3);
 
   for (size_t n = 0; n < starts.size(); ++n)
   {
@@ -1727,9 +1750,10 @@ bool CMediaPipelineWebOS::FeedVideoData(const std::shared_ptr<CDVDMsg>& msg)
     {
       size_t firstEl = size;
       bool elAud = false;
-      for (size_t i = 0; i + 5 < size; ++i)
+      for (size_t i = NextStartCode(data, 0, size); i + 5 < size;
+           i = NextStartCode(data, i + 1, size))
       {
-        if (data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1 && data[i + 3] == 0x7e)
+        if (data[i + 3] == 0x7e)
         {
           if (firstEl == size)
             firstEl = (i > 0 && data[i - 1] == 0) ? i - 1 : i;
@@ -1750,16 +1774,12 @@ bool CMediaPipelineWebOS::FeedVideoData(const std::shared_ptr<CDVDMsg>& msg)
         size = m_dualLayerBuffer.size();
       }
       // the EL's SPS comes in-band at its IRAPs, wrapped in NAL 63
-      for (size_t i = 0; i + 5 < size; ++i)
+      for (size_t i = NextStartCode(data, 0, size); i + 5 < size;
+           i = NextStartCode(data, i + 1, size))
       {
-        if (data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1 && data[i + 3] == 0x7e &&
-            ((data[i + 5] >> 1) & 0x3f) == 33)
+        if (data[i + 3] == 0x7e && ((data[i + 5] >> 1) & 0x3f) == 33)
         {
-          size_t e = i + 3;
-          while (e + 3 <= size && !(data[e] == 0 && data[e + 1] == 0 && data[e + 2] == 1))
-            ++e;
-          if (e + 3 > size)
-            e = size;
+          const size_t e = NextStartCode(data, i + 3, size);
           const auto parsed = ParseSpsPicTimingCpbDelay(data + i + 5, e - (i + 5));
           std::optional<std::pair<unsigned int, unsigned int>> field;
           if (parsed)
@@ -1776,7 +1796,8 @@ bool CMediaPipelineWebOS::FeedVideoData(const std::shared_ptr<CDVDMsg>& msg)
           break;
         }
       }
-      if (m_elCpbDelay)
+      // copied only to be changed: without an EL CRA (or an added buffering period) nothing is
+      if (m_elCpbDelay && (m_zeroElCpbDelay || HasElCra(data, size)))
       {
         if (data != m_dualLayerBuffer.data())
           m_dualLayerBuffer.assign(data, data + size);
